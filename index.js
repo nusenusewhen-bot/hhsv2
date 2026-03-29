@@ -38,17 +38,23 @@ class SelfbotManager {
         const client = new SelfbotClient({ checkUpdate: false });
 
         return new Promise((resolve) => {
+            let resolved = false;
+            
             client.once('ready', () => {
+                if (resolved) return;
+                resolved = true;
                 this.clients.set(userId, { client, categoryId });
                 db.prepare('UPDATE user_configs SET is_running = 1 WHERE user_id = ?').run(userId);
                 resolve({ success: true, tag: client.user.tag });
             });
 
             setTimeout(() => {
-                if (!client.user) resolve({ success: false, error: 'Timeout' });
-            }, 10000);
+                if (!resolved) {
+                    resolved = true;
+                    resolve({ success: false, error: 'Timeout' });
+                }
+            }, 15000);
 
-            // Multiple detection methods
             client.ws.on('MESSAGE_CREATE', (p) => this.handleWS(userId, client, p, categoryId));
             client.ws.on('MESSAGE_UPDATE', (p) => this.handleWS(userId, client, p, categoryId));
             client.on('messageCreate', (m) => this.handleMessage(userId, client, m, categoryId));
@@ -61,7 +67,12 @@ class SelfbotManager {
                 }
             });
 
-            client.login(token).catch(e => resolve({ success: false, error: e.message }));
+            client.login(token).catch(e => {
+                if (!resolved) {
+                    resolved = true;
+                    resolve({ success: false, error: e.message });
+                }
+            });
         });
     }
 
@@ -79,14 +90,12 @@ class SelfbotManager {
     async claim(userId, client, channelId, messageId, btn, guildId, applicationId) {
         if (this.claimed.has(userId)) return;
         
-        // Prevent double-clicking same message
         const msgKey = `${userId}-${messageId}`;
         if (this.processedMessages.has(msgKey)) return;
         this.processedMessages.add(msgKey);
         setTimeout(() => this.processedMessages.delete(msgKey), 30000);
 
         try {
-            // Method 1: WS broadcast (fastest)
             client.ws.broadcast({
                 op: 1,
                 d: {
@@ -103,35 +112,9 @@ class SelfbotManager {
 
             this.claimed.set(userId, channelId);
             db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(channelId, userId);
-            console.log(`[${userId}] Claimed ${channelId} via WS`);
-
-            // Method 2 fallback: HTTP API
-            setTimeout(() => {
-                if (this.claimed.get(userId) === channelId) {
-                    this.clickViaAPI(client, guildId, channelId, messageId, applicationId, btn.custom_id);
-                }
-            }, 500);
+            console.log(`[${userId}] Claimed ${channelId}`);
         } catch (e) {
             console.log(`[${userId}] Claim error: ${e.message}`);
-        }
-    }
-
-    async clickViaAPI(client, guildId, channelId, messageId, applicationId, customId) {
-        try {
-            await client.api.interactions.post({
-                data: {
-                    type: 3,
-                    nonce: Date.now().toString(),
-                    guild_id: guildId,
-                    channel_id: channelId,
-                    message_id: messageId,
-                    application_id: applicationId,
-                    session_id: client.sessionId,
-                    data: { component_type: 2, custom_id: customId }
-                }
-            });
-        } catch (e) {
-            console.log(`API click failed: ${e.message}`);
         }
     }
 
@@ -152,27 +135,19 @@ class SelfbotManager {
         const btn = this.hasClaimButton(message.components);
         if (!btn) return;
 
-        // Try library method first
         message.clickButton(btn.customId).then(() => {
             this.claimed.set(userId, message.channelId);
             db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(message.channelId, userId);
-            console.log(`[${userId}] Claimed ${message.channelId} via clickButton`);
-        }).catch(() => {
-            // Fallback to WS
-            this.claim(userId, client, message.channelId, message.id, btn, message.guildId, message.applicationId || message.author?.id);
-        });
+            console.log(`[${userId}] Claimed via clickButton`);
+        }).catch(() => {});
     }
 
     async handleChannel(userId, client, channel, categoryId) {
         if (channel.parentId !== categoryId) return;
         if (this.claimed.has(userId)) return;
         
-        console.log(`[${userId}] New channel: ${channel.name}`);
-        
-        // Wait for messages
         for (let i = 0; i < 5; i++) {
             await new Promise(r => setTimeout(r, 200));
-            
             try {
                 const messages = await channel.messages.fetch({ limit: 5 });
                 for (const [, msg] of messages) {
@@ -182,20 +157,24 @@ class SelfbotManager {
                         return;
                     }
                 }
-            } catch (e) {
-                console.log(`Fetch error: ${e.message}`);
-            }
+            } catch (e) {}
         }
     }
 
     async stop(userId) {
+        console.log(`[STOP] Stopping ${userId}`);
         const data = this.clients.get(userId);
         if (data) {
-            await data.client.destroy();
+            try {
+                await data.client.destroy();
+            } catch (e) {
+                console.log(`[STOP] Destroy error: ${e.message}`);
+            }
             this.clients.delete(userId);
             this.claimed.delete(userId);
         }
         db.prepare('UPDATE user_configs SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(userId);
+        console.log(`[STOP] Stopped ${userId}`);
     }
 
     isRunning(userId) {
@@ -218,9 +197,9 @@ function hasKey(userId) {
     return db.prepare('SELECT 1 FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(userId, Date.now());
 }
 
-async function showPanel(ix) {
-    const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id) || {};
-    const running = manager.isRunning(ix.user.id);
+async function showPanel(userId) {
+    const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(userId) || {};
+    const running = manager.isRunning(userId);
     
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('set_token').setLabel(cfg.token ? 'Update Token' : 'Set Token').setStyle(ButtonStyle.Primary),
@@ -289,7 +268,7 @@ bot.on('interactionCreate', async (ix) => {
         
         if (commandName === 'manage') {
             if (!hasKey(ix.user.id)) return ix.editReply('No active key');
-            const panel = await showPanel(ix);
+            const panel = await showPanel(ix.user.id);
             return ix.editReply(panel);
         }
     }
@@ -330,22 +309,29 @@ bot.on('interactionCreate', async (ix) => {
             });
         }
         if (ix.customId === 'toggle') {
-            try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
-            const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id);
+            // CRITICAL FIX: Defer update to edit the original message
+            try { await ix.deferUpdate(); } catch { return; }
             
-            if (manager.isRunning(ix.user.id)) {
+            const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id);
+            const wasRunning = manager.isRunning(ix.user.id);
+            
+            if (wasRunning) {
+                console.log(`[TOGGLE] Stopping ${ix.user.id}`);
                 await manager.stop(ix.user.id);
-                const panel = await showPanel(ix);
-                return ix.editReply(panel);
             } else {
+                console.log(`[TOGGLE] Starting ${ix.user.id}`);
                 const res = await manager.start(ix.user.id, cfg.token, cfg.category_id);
-                if (res.success) {
-                    const panel = await showPanel(ix);
-                    return ix.editReply(panel);
-                } else {
-                    return ix.editReply('Error: ' + res.error);
+                if (!res.success) {
+                    // Update with error then return
+                    const errorPanel = await showPanel(ix.user.id);
+                    errorPanel.embeds[0].setDescription('Error: ' + res.error).setColor(0xFF0000);
+                    return ix.editReply(errorPanel);
                 }
             }
+            
+            // Show updated panel
+            const panel = await showPanel(ix.user.id);
+            return ix.editReply(panel);
         }
     }
 });
@@ -362,7 +348,7 @@ bot.on('interactionCreate', async (ix) => {
             await test.destroy();
             db.prepare('INSERT OR REPLACE INTO user_configs (user_id, token) VALUES (?, ?)').run(ix.user.id, tok);
             
-            const panel = await showPanel(ix);
+            const panel = await showPanel(ix.user.id);
             await ix.deferReply({ flags: MessageFlags.Ephemeral });
             await ix.editReply(panel);
         } catch (e) {
@@ -375,7 +361,7 @@ bot.on('interactionCreate', async (ix) => {
         const catId = ix.fields.getTextInputValue('cat');
         db.prepare('UPDATE user_configs SET category_id = ? WHERE user_id = ?').run(catId, ix.user.id);
         
-        const panel = await showPanel(ix);
+        const panel = await showPanel(ix.user.id);
         await ix.deferReply({ flags: MessageFlags.Ephemeral });
         await ix.editReply(panel);
     }
