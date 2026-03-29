@@ -22,6 +22,7 @@ class SelfbotManager {
         this.client = null;
         this.currentTicket = config.current_ticket;
         this.processed = new Set();
+        this.claimedChannels = new Set();
     }
 
     async start() {
@@ -29,19 +30,40 @@ class SelfbotManager {
         this.client = new SelfbotClient({ checkUpdate: false });
 
         this.client.once('ready', async () => {
-            console.log(`[READY] ${this.userId}`);
+            console.log(`[READY] ${this.userId} - ${this.client.user.tag}`);
             
+            // Monitor channel creates in specific category
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
-                if (packet.parent_id !== this.config.category_id) return;
-                if (this.currentTicket) return;
-                setTimeout(() => this.checkChannel(packet.id), 200);
+                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id} | target: ${this.config.category_id}`);
+                if (packet.parent_id !== this.config.category_id) {
+                    console.log(`[SKIP] Wrong category`);
+                    return;
+                }
+                if (this.currentTicket) {
+                    console.log(`[SKIP] Already have ticket: ${this.currentTicket}`);
+                    return;
+                }
+                console.log(`[CHECK] New ticket channel: ${packet.id}`);
+                setTimeout(() => this.checkChannel(packet.id), 100);
             });
 
-            this.client.on('messageCreate', (msg) => this.handleMessage(msg));
-            this.client.on('messageUpdate', (old, msg) => this.handleMessage(msg));
+            // Monitor all messages in category
+            this.client.on('messageCreate', (msg) => {
+                console.log(`[MSG_CREATE] ${msg.channelId} | components: ${msg.components?.length || 0}`);
+                this.handleMessage(msg);
+            });
+            
+            this.client.on('messageUpdate', (old, msg) => {
+                console.log(`[MSG_UPDATE] ${msg.channelId} | components: ${msg.components?.length || 0}`);
+                this.handleMessage(msg);
+            });
+            
             this.client.on('channelDelete', (ch) => {
+                console.log(`[CHANNEL_DELETE] ${ch.id}`);
                 if (this.currentTicket === ch.id) {
+                    console.log(`[RESET] Current ticket deleted`);
                     this.currentTicket = null;
+                    this.claimedChannels.delete(ch.id);
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
                 }
             });
@@ -51,31 +73,86 @@ class SelfbotManager {
     }
 
     async checkChannel(channelId) {
-        if (this.currentTicket) return;
+        if (this.currentTicket) {
+            console.log(`[CHECK_SKIP] Already have ticket`);
+            return;
+        }
+        if (this.claimedChannels.has(channelId)) {
+            console.log(`[CHECK_SKIP] Already claimed this channel`);
+            return;
+        }
+        
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 5 });
+            console.log(`[FETCHED] ${channelId} | name: ${channel.name}`);
+            const messages = await channel.messages.fetch({ limit: 10 });
+            console.log(`[MESSAGES] Fetched ${messages.size} messages`);
+            
             for (const [, msg] of messages) {
-                if (this.handleMessage(msg)) return;
+                console.log(`[SCAN] ${msg.id} | author: ${msg.author?.tag} | components: ${msg.components?.length || 0}`);
+                if (this.handleMessage(msg)) {
+                    console.log(`[FOUND] Claim button found in history`);
+                    return;
+                }
             }
-        } catch (e) {}
+            console.log(`[NO_BUTTON] No claim button found in channel ${channelId}`);
+        } catch (e) {
+            console.log(`[ERROR] checkChannel: ${e.message}`);
+        }
     }
 
     handleMessage(msg) {
-        if (msg.channel.parentId !== this.config.category_id) return;
-        if (this.currentTicket && this.currentTicket !== msg.channelId) return;
+        // Only process if in target category
+        if (msg.channel.parentId !== this.config.category_id) {
+            return false;
+        }
+        
+        // Skip if already handling a ticket (unless it's the current ticket)
+        if (this.currentTicket && this.currentTicket !== msg.channelId) {
+            console.log(`[SKIP_MSG] Have different ticket: ${this.currentTicket}`);
+            return false;
+        }
+        
+        // Skip if already claimed this channel
+        if (this.claimedChannels.has(msg.channelId)) {
+            console.log(`[SKIP_MSG] Already claimed: ${msg.channelId}`);
+            return false;
+        }
         
         const key = `${msg.channelId}-${msg.id}`;
-        if (this.processed.has(key)) return false;
-        if (!msg.components?.length) return false;
+        if (this.processed.has(key)) {
+            console.log(`[SKIP_MSG] Already processed: ${key}`);
+            return false;
+        }
+        
+        if (!msg.components?.length) {
+            return false;
+        }
+
+        console.log(`[COMPONENTS] ${msg.components.length} rows in ${msg.id}`);
 
         for (const row of msg.components) {
             for (const btn of row.components) {
-                const label = (btn.label || '').toLowerCase();
-                if (!label.includes('claim')) continue;
-                if (btn.disabled) continue;
-                if (!btn.custom_id) continue;
+                console.log(`[BUTTON] label: "${btn.label}" | custom_id: ${btn.custom_id} | disabled: ${btn.disabled}`);
                 
+                const label = (btn.label || '').toLowerCase();
+                // Check for claim/Claim in label
+                if (!label.includes('claim')) {
+                    console.log(`[SKIP_BTN] No 'claim' in label`);
+                    continue;
+                }
+                
+                if (btn.disabled) {
+                    console.log(`[SKIP_BTN] Button disabled`);
+                    continue;
+                }
+                
+                if (!btn.custom_id) {
+                    console.log(`[SKIP_BTN] No custom_id`);
+                    continue;
+                }
+                
+                console.log(`[CLAIM_FOUND] ${btn.label} | ${btn.custom_id}`);
                 this.processed.add(key);
                 this.claimViaWS(msg, btn);
                 return true;
@@ -85,7 +162,17 @@ class SelfbotManager {
     }
 
     claimViaWS(message, btn) {
-        if (this.currentTicket) return;
+        if (this.currentTicket) {
+            console.log(`[CLAIM_SKIP] Already have ticket: ${this.currentTicket}`);
+            return;
+        }
+        
+        if (this.claimedChannels.has(message.channelId)) {
+            console.log(`[CLAIM_SKIP] Channel already claimed: ${message.channelId}`);
+            return;
+        }
+        
+        console.log(`[CLAIMING] Channel: ${message.channelId} | Button: ${btn.custom_id}`);
         
         this.client.ws.broadcast({
             op: 1,
@@ -102,16 +189,28 @@ class SelfbotManager {
         });
 
         this.currentTicket = message.channelId;
+        this.claimedChannels.add(message.channelId);
         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
-        console.log(`[${this.userId}] Claimed: ${message.channelId}`);
+        console.log(`[CLAIMED] ${this.userId} -> ${message.channelId}`);
+        
+        // Auto-reset after 5 minutes to allow new claims
+        setTimeout(() => {
+            if (this.currentTicket === message.channelId) {
+                console.log(`[AUTO_RESET] Ticket timeout: ${message.channelId}`);
+                this.currentTicket = null;
+                db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+            }
+        }, 300000);
     }
 
     stop() {
+        console.log(`[STOP] ${this.userId}`);
         if (this.client) {
             this.client.destroy();
             this.client = null;
         }
         this.currentTicket = null;
+        this.claimedChannels.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
 }
