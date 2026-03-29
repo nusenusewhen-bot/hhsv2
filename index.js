@@ -23,6 +23,8 @@ class SelfbotManager {
         this.currentTicket = config.current_ticket;
         this.processed = new Set();
         this.rawComponents = new Map();
+        this.newChannels = new Set();
+        this.claimedChannels = new Set();
     }
 
     async start() {
@@ -30,12 +32,11 @@ class SelfbotManager {
         this.client = new SelfbotClient({ checkUpdate: false });
 
         this.client.once('ready', () => {
-            console.log(`[READY] ${this.userId} - ${this.client.user?.tag || 'unknown'}`);
+            console.log(`[READY] ${this.userId}`);
             
             this.client.ws.on('MESSAGE_CREATE', (data) => {
                 if (data?.components?.length) {
                     this.rawComponents.set(data.id, data.components);
-                    console.log(`[RAW] Captured ${data.id} with ${data.components.length} rows`);
                 }
             });
 
@@ -46,23 +47,45 @@ class SelfbotManager {
             });
 
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
-                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id} | target: ${this.config.category_id}`);
+                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id}`);
                 if (packet.parent_id !== this.config.category_id) {
                     console.log(`[SKIP] Wrong category`);
                     return;
                 }
                 if (this.currentTicket) {
-                    console.log(`[SKIP] Already have ticket: ${this.currentTicket}`);
+                    console.log(`[SKIP] Have ticket`);
                     return;
                 }
-                console.log(`[CHECK] New ticket channel: ${packet.id}`);
-                setTimeout(() => this.checkChannel(packet.id), 50);
+                
+                console.log(`[NEW] Tracking channel ${packet.id}`);
+                this.newChannels.add(packet.id);
+                
+                setTimeout(() => this.checkChannel(packet.id), 100);
+                
+                // Auto-cleanup after 60 seconds
+                setTimeout(() => {
+                    this.newChannels.delete(packet.id);
+                    console.log(`[CLEANUP] ${packet.id}`);
+                }, 60000);
             });
 
-            this.client.on('messageCreate', (msg) => this.handleMessage(msg));
-            this.client.on('messageUpdate', (old, msg) => this.handleMessage(msg));
+            // ONLY process messages in NEW channels
+            this.client.on('messageCreate', (msg) => {
+                if (!this.newChannels.has(msg.channelId)) {
+                    return;
+                }
+                console.log(`[MSG_NEW] ${msg.channelId} | components: ${msg.components?.length || 0}`);
+                this.handleMessage(msg);
+            });
+            
+            this.client.on('messageUpdate', (old, msg) => {
+                if (!this.newChannels.has(msg.channelId)) return;
+                this.handleMessage(msg);
+            });
             
             this.client.on('channelDelete', (ch) => {
+                this.newChannels.delete(ch.id);
+                this.claimedChannels.delete(ch.id);
                 if (this.currentTicket === ch.id) {
                     this.currentTicket = null;
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
@@ -74,38 +97,34 @@ class SelfbotManager {
     }
 
     async checkChannel(channelId) {
+        if (!this.newChannels.has(channelId)) return;
         if (this.currentTicket) return;
+        if (this.claimedChannels.has(channelId)) return;
+        
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 10 });
+            const messages = await channel.messages.fetch({ limit: 5 });
+            
             for (const [, msg] of messages) {
                 if (this.handleMessage(msg)) return;
             }
         } catch (e) {
-            console.log(`[ERROR] checkChannel: ${e.message}`);
+            console.log(`[ERROR] ${e.message}`);
         }
     }
 
     handleMessage(msg) {
-        if (!msg.channel?.parentId || msg.channel.parentId !== this.config.category_id) return false;
-        if (this.currentTicket && this.currentTicket !== msg.channelId) return false;
+        if (!this.newChannels.has(msg.channelId)) return false;
+        if (msg.channel?.parentId !== this.config.category_id) return false;
+        if (this.currentTicket) return false;
+        if (this.claimedChannels.has(msg.channelId)) return false;
         
         const key = `${msg.channelId}-${msg.id}`;
         if (this.processed.has(key)) return false;
         if (!msg.components?.length) return false;
 
         const rawData = this.rawComponents.get(msg.id);
-        console.log(`[DEBUG] Msg ${msg.id} | Raw stored: ${!!rawData} | Components: ${msg.components.length}`);
 
-        // Aggressive scan - check if this looks like a ticket message
-        const contentHasClaim = (msg.content || '').toLowerCase().includes('claim');
-        const embedHasClaim = msg.embeds?.some(e => 
-            (e.title || '').toLowerCase().includes('claim') ||
-            (e.description || '').toLowerCase().includes('claim') ||
-            (e.footer?.text || '').toLowerCase().includes('claim')
-        );
-
-        // Deep component scan
         for (let r = 0; r < msg.components.length; r++) {
             const row = msg.components[r];
             const rawRow = rawData?.[r];
@@ -115,41 +134,26 @@ class SelfbotManager {
                 const rawBtn = rawRow?.components?.[b];
                 
                 const label = (btn.label || '').toLowerCase();
-                const hasClaimLabel = label.includes('claim') || label.includes('ticket') || label.includes('take');
                 
-                console.log(`[BTN_SCAN] Row ${r} Btn ${b} | Label: "${btn.label}" | RawID: ${rawBtn?.custom_id} | BtnID: ${btn.custom_id}`);
-
-                // Try all possible sources for custom_id
-                let customId = rawBtn?.custom_id || btn.custom_id || btn.data?.custom_id;
+                // STRICT claim detection
+                const isClaim = label.includes('claim') && 
+                               !label.includes('token') && 
+                               !label.includes('category') &&
+                               !label.includes('start') && 
+                               !label.includes('stop') &&
+                               !label.includes('close');
                 
-                // Deep search in raw data if not found
-                if (!customId && rawData) {
-                    for (const searchRow of rawData) {
-                        for (const searchBtn of searchRow.components || []) {
-                            const searchLabel = (searchBtn.label || '').toLowerCase();
-                            if ((searchLabel.includes('claim') || searchLabel.includes('ticket')) && searchBtn.custom_id) {
-                                customId = searchBtn.custom_id;
-                                console.log(`[DEEP_FIND] Found: ${customId}`);
-                                break;
-                            }
-                        }
-                        if (customId) break;
-                    }
-                }
-
-                // Claim if label matches and we have custom_id
-                if (!hasClaimLabel && !contentHasClaim && !embedHasClaim) continue;
+                if (!isClaim) continue;
                 if (btn.disabled) continue;
                 
-                if (!customId) {
-                    console.log(`[SKIP] No custom_id for claim button "${btn.label}"`);
-                    continue;
-                }
+                const customId = rawBtn?.custom_id || btn.custom_id;
+                if (!customId) continue;
 
-                console.log(`[CLAIM_EXEC] Channel: ${msg.channelId} | Button: "${btn.label}" | ID: ${customId}`);
+                console.log(`[CLAIM] ${msg.channelId} | ${btn.label} | ${customId}`);
                 this.processed.add(key);
                 this.claimViaWS(msg, customId);
                 this.rawComponents.delete(msg.id);
+                this.newChannels.delete(msg.channelId);
                 return true;
             }
         }
@@ -159,7 +163,7 @@ class SelfbotManager {
     claimViaWS(message, customId) {
         if (this.currentTicket) return;
         
-        const payload = {
+        this.client.ws.broadcast({
             op: 1,
             d: {
                 type: 3,
@@ -167,19 +171,16 @@ class SelfbotManager {
                 guild_id: String(message.guildId),
                 channel_id: String(message.channelId),
                 message_id: String(message.id),
-                application_id: String(message.applicationId || message.author?.id || message.authorId),
+                application_id: String(message.applicationId || message.author?.id),
                 session_id: String(this.client.sessionId),
-                data: { 
-                    component_type: 2, 
-                    custom_id: String(customId)
-                }
+                data: { component_type: 2, custom_id: String(customId) }
             }
-        };
-        
-        console.log(`[PAYLOAD] ${JSON.stringify(payload)}`);
-        this.client.ws.broadcast(payload);
+        });
 
         this.currentTicket = message.channelId;
+        this.claimedChannels.add(message.channelId);
+        this.newChannels.delete(message.channelId);
+        
         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
         console.log(`[CLAIMED] ${this.userId} -> ${message.channelId}`);
         
@@ -197,6 +198,8 @@ class SelfbotManager {
             this.client = null;
         }
         this.currentTicket = null;
+        this.newChannels.clear();
+        this.claimedChannels.clear();
         this.rawComponents.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
