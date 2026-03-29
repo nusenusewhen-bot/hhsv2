@@ -143,99 +143,8 @@ bot.on('interactionCreate', async (ix) => {
         if (commandName === 'generatekey') {
             const dur = options.getString('duration');
             const days = dur === 'lifetime' ? 'lifetime' : parseInt(dur);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key').setDescription(` user_id = ?').run(userId);
-                }
-            });
-
-            client.login(token).catch(e => resolve({ success: false, error: e.message }));
-        });
-    }
-
-    handle(userId, client, packet) {
-        if (!packet.guild_id) return;
-        if (this.claimed.has(userId) && this.claimed.get(userId) !== packet.channel_id) return;
-        if (!packet.components?.length) return;
-
-        for (const row of packet.components) {
-            for (const btn of row.components) {
-                if (!(btn.type === 2 || btn.type === 'BUTTON')) continue;
-                if (!btn.label?.toLowerCase().includes('claim')) continue;
-                if (this.claimed.has(userId)) return;
-
-                client.ws.broadcast({
-                    op: 1,
-                    d: {
-                        type: 3,
-                        nonce: Date.now().toString(),
-                        guild_id: packet.guild_id,
-                        channel_id: packet.channel_id,
-                        message_id: packet.id,
-                        application_id: packet.application_id || packet.author?.id,
-                        session_id: client.sessionId,
-                        data: { component_type: 2, custom_id: btn.custom_id }
-                    }
-                });
-
-                this.claimed.set(userId, packet.channel_id);
-                db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(packet.channel_id, userId);
-                this.monitor(userId, client, packet.channel_id);
-            }
-        }
-    }
-
-    monitor(userId, client, channelId) {
-        const handler = (msg) => {
-            if (msg.channelId !== channelId) return;
-            const closed = msg.content?.toLowerCase().includes('closed') || 
-                          msg.embeds?.some(e => e.description?.toLowerCase().includes('closed'));
-            if (closed) {
-                this.claimed.delete(userId);
-                db.prepare('UPDATE user_configs SET current_ticket = NULL WHERE user_id = ?').run(userId);
-                client.off('messageCreate', handler);
-            }
-        };
-        client.on('messageCreate', handler);
-        setTimeout(() => client.off('messageCreate', handler), 86400000);
-    }
-
-    async stop(userId) {
-        const data = this.clients.get(userId);
-        if (data) {
-            await data.client.destroy();
-            this.clients.delete(userId);
-            this.claimed.delete(userId);
-        }
-        db.prepare('UPDATE user_configs SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(userId);
-    }
-}
-
-const manager = new SelfbotManager();
-const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-
-function genKey(duration) {
-    const key = 'TKT-' + crypto.randomBytes(8).toString('hex').toUpperCase();
-    const exp = duration === 'lifetime' ? null : Date.now() + (duration * 86400000);
-    db.prepare('INSERT INTO keys (key, duration_days, created_at, expires_at) VALUES (?, ?, ?, ?)')
-      .run(key, duration === 'lifetime' ? -1 : duration, Date.now(), exp);
-    return key;
-}
-
-function hasKey(userId) {
-    return db.prepare('SELECT 1 FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(userId, Date.now());
-}
-
-bot.on('interactionCreate', async (ix) => {
-    if (ix.isCommand() || ix.isButton()) {
-        try { await ix.deferReply({ ephemeral: true }); } catch { return; }
-    }
-
-    if (ix.isCommand() && ix.user.id === OWNER_ID) {
-        const { commandName, options } = ix;
-        
-        if (commandName === 'generatekey') {
-            const dur = options.getString('duration');
-            const days = dur === 'lifetime' ? 'lifetime' : parseInt(dur);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key').setDescription(`\`${genKey(days)}\``).setColor(0x00FF00)] });
+            const key = genKey(days);
+            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key').setDescription('`' + key + '`').setColor(0x00FF00)] });
         }
         
         if (commandName === 'revokekey') {
@@ -295,7 +204,7 @@ bot.on('interactionCreate', async (ix) => {
                 return ix.editReply('🛑 Stopped');
             }
             const res = await manager.start(ix.user.id, cfg.token, cfg.category_id);
-            return ix.editReply(res.success ? { embeds: [new EmbedBuilder().setTitle('🎫 Started').setDescription(res.tag).setColor(0x00FF00)] } : `❌ ${res.error}`);
+            return ix.editReply(res.success ? { embeds: [new EmbedBuilder().setTitle('🎫 Started').setDescription(res.tag).setColor(0x00FF00)] } : '❌ ' + res.error);
         }
     }
 });
@@ -311,7 +220,7 @@ bot.on('interactionCreate', async (ix) => {
             const tag = test.user.tag;
             await test.destroy();
             db.prepare('INSERT OR REPLACE INTO user_configs (user_id, token) VALUES (?, ?)').run(ix.user.id, tok);
-            return ix.reply({ content: `✅ ${tag}`, ephemeral: true });
+            return ix.reply({ content: '✅ ' + tag, ephemeral: true });
         } catch (e) {
             return ix.reply({ content: '❌ Invalid', ephemeral: true });
         }
@@ -324,191 +233,7 @@ bot.on('interactionCreate', async (ix) => {
 });
 
 bot.once('ready', async () => {
-    console.log(`[BOT] ${bot.user.tag}`);
-    await bot.application.commands.set([
-        { name: 'generatekey', description: '[OWNER] Generate key', options: [{ name: 'duration', type: 3, required: true, choices: [{ name: '1 Day', value: '1' }, { name: '7 Days', value: '7' }, { name: '30 Days', value: '30' }, { name: 'Lifetime', value: 'lifetime' }] }] },
-        { name: 'revokekey user_id = ?').run(userId);
-                }
-            });
-
-            client.login(token).catch(e => resolve({ success: false, error: e.message }));
-        });
-    }
-
-    handle(userId, client, packet) {
-        if (!packet.guild_id) return;
-        if (this.claimed.has(userId) && this.claimed.get(userId) !== packet.channel_id) return;
-        if (!packet.components?.length) return;
-
-        for (const row of packet.components) {
-            for (const btn of row.components) {
-                if (!(btn.type === 2 || btn.type === 'BUTTON')) continue;
-                if (!btn.label?.toLowerCase().includes('claim')) continue;
-                if (this.claimed.has(userId)) return;
-
-                client.ws.broadcast({
-                    op: 1,
-                    d: {
-                        type: 3,
-                        nonce: Date.now().toString(),
-                        guild_id: packet.guild_id,
-                        channel_id: packet.channel_id,
-                        message_id: packet.id,
-                        application_id: packet.application_id || packet.author?.id,
-                        session_id: client.sessionId,
-                        data: { component_type: 2, custom_id: btn.custom_id }
-                    }
-                });
-
-                this.claimed.set(userId, packet.channel_id);
-                db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(packet.channel_id, userId);
-                this.monitor(userId, client, packet.channel_id);
-            }
-        }
-    }
-
-    monitor(userId, client, channelId) {
-        const handler = (msg) => {
-            if (msg.channelId !== channelId) return;
-            const closed = msg.content?.toLowerCase().includes('closed') || 
-                          msg.embeds?.some(e => e.description?.toLowerCase().includes('closed'));
-            if (closed) {
-                this.claimed.delete(userId);
-                db.prepare('UPDATE user_configs SET current_ticket = NULL WHERE user_id = ?').run(userId);
-                client.off('messageCreate', handler);
-            }
-        };
-        client.on('messageCreate', handler);
-        setTimeout(() => client.off('messageCreate', handler), 86400000);
-    }
-
-    async stop(userId) {
-        const data = this.clients.get(userId);
-        if (data) {
-            await data.client.destroy();
-            this.clients.delete(userId);
-            this.claimed.delete(userId);
-        }
-        db.prepare('UPDATE user_configs SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(userId);
-    }
-}
-
-const manager = new SelfbotManager();
-const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
-
-function genKey(duration) {
-    const key = 'TKT-' + crypto.randomBytes(8).toString('hex').toUpperCase();
-    const exp = duration === 'lifetime' ? null : Date.now() + (duration * 86400000);
-    db.prepare('INSERT INTO keys (key, duration_days, created_at, expires_at) VALUES (?, ?, ?, ?)')
-      .run(key, duration === 'lifetime' ? -1 : duration, Date.now(), exp);
-    return key;
-}
-
-function hasKey(userId) {
-    return db.prepare('SELECT 1 FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(userId, Date.now());
-}
-
-bot.on('interactionCreate', async (ix) => {
-    if (ix.isCommand() || ix.isButton()) {
-        try { await ix.deferReply({ ephemeral: true }); } catch { return; }
-    }
-
-    if (ix.isCommand() && ix.user.id === OWNER_ID) {
-        const { commandName, options } = ix;
-        
-        if (commandName === 'generatekey') {
-            const dur = options.getString('duration');
-            const days = dur === 'lifetime' ? 'lifetime' : parseInt(dur);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key').setDescription(`\`${genKey(days)}\``).setColor(0x00FF00)] });
-        }
-        
-        if (commandName === 'revokekey') {
-            db.prepare('UPDATE keys SET active = 0 WHERE key = ?').run(options.getString('key'));
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 Revoked').setColor(0xFF0000)] });
-        }
-        
-        if (commandName === 'revokeuser') {
-            const user = options.getUser('user');
-            db.prepare('UPDATE keys SET active = 0 WHERE redeemed_by = ?').run(user.id);
-            await manager.stop(user.id);
-            db.prepare('DELETE FROM user_configs WHERE user_id = ?').run(user.id);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 User Revoked').setColor(0xFF0000)] });
-        }
-    }
-
-    if (ix.isCommand()) {
-        const { commandName, options } = ix;
-        
-        if (commandName === 'redeemkey') {
-            const k = db.prepare('SELECT * FROM keys WHERE key = ? AND active = 1').get(options.getString('key'));
-            if (!k) return ix.editReply('❌ Invalid');
-            if (k.redeemed_by) return ix.editReply('❌ Used');
-            
-            const exp = k.duration_days === -1 ? null : Date.now() + (k.duration_days * 86400000);
-            db.prepare('UPDATE keys SET redeemed_by = ?, redeemed_at = ?, expires_at = ? WHERE key = ?')
-              .run(ix.user.id, Date.now(), exp, options.getString('key'));
-            db.prepare('INSERT OR REPLACE INTO user_configs (user_id) VALUES (?)').run(ix.user.id);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Redeemed').setColor(0x00FF00)] });
-        }
-        
-        if (commandName === 'manage') {
-            if (!hasKey(ix.user.id)) return ix.editReply('❌ No key');
-            const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id) || {};
-            
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('set_token').setLabel(cfg.token ? '🔐 Token' : '🔐 Set Token').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('set_cat').setLabel(cfg.category_id ? '📁 Category' : '📁 Set Category').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('toggle').setLabel(cfg.is_running ? '🛑 Stop' : '▶️ Start').setStyle(cfg.is_running ? ButtonStyle.Danger : ButtonStyle.Success).setDisabled(!cfg.token || !cfg.category_id)
-            );
-            
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🎫 Panel').addFields({ name: 'Status', value: cfg.is_running ? '🟢 Running' : '🔴 Stopped' }).setColor(cfg.is_running ? 0x00FF00 : 0xFFA500)], components: [row] });
-        }
-    }
-
-    if (ix.isButton()) {
-        if (ix.customId === 'set_token') {
-            return ix.showModal({ title: 'Token', custom_id: 'mod_token', components: [{ type: 1, components: [{ type: 4, custom_id: 'tok', label: 'Discord Token', style: 1, required: true }] }] });
-        }
-        if (ix.customId === 'set_cat') {
-            return ix.showModal({ title: 'Category', custom_id: 'mod_cat', components: [{ type: 1, components: [{ type: 4, custom_id: 'cat', label: 'Category ID', style: 1, required: true }] }] });
-        }
-        if (ix.customId === 'toggle') {
-            const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id);
-            if (cfg.is_running) {
-                await manager.stop(ix.user.id);
-                return ix.editReply('🛑 Stopped');
-            }
-            const res = await manager.start(ix.user.id, cfg.token, cfg.category_id);
-            return ix.editReply(res.success ? { embeds: [new EmbedBuilder().setTitle('🎫 Started').setDescription(res.tag).setColor(0x00FF00)] } : `❌ ${res.error}`);
-        }
-    }
-});
-
-bot.on('interactionCreate', async (ix) => {
-    if (!ix.isModalSubmit()) return;
-    
-    if (ix.customId === 'mod_token') {
-        const tok = ix.fields.getTextInputValue('tok');
-        const test = new SelfbotClient({ checkUpdate: false });
-        try {
-            await test.login(tok);
-            const tag = test.user.tag;
-            await test.destroy();
-            db.prepare('INSERT OR REPLACE INTO user_configs (user_id, token) VALUES (?, ?)').run(ix.user.id, tok);
-            return ix.reply({ content: `✅ ${tag}`, ephemeral: true });
-        } catch (e) {
-            return ix.reply({ content: '❌ Invalid', ephemeral: true });
-        }
-    }
-    
-    if (ix.customId === 'mod_cat') {
-        db.prepare('UPDATE user_configs SET category_id = ? WHERE user_id = ?').run(ix.fields.getTextInputValue('cat'), ix.user.id);
-        return ix.reply({ content: '✅ Set', ephemeral: true });
-    }
-});
-
-bot.once('ready', async () => {
-    console.log(`[BOT] ${bot.user.tag}`);
+    console.log('[BOT] ' + bot.user.tag);
     await bot.application.commands.set([
         { name: 'generatekey', description: '[OWNER] Generate key', options: [{ name: 'duration', type: 3, required: true, choices: [{ name: '1 Day', value: '1' }, { name: '7 Days', value: '7' }, { name: '30 Days', value: '30' }, { name: 'Lifetime', value: 'lifetime' }] }] },
         { name: 'revokekey', description: '[OWNER] Revoke key', options: [{ name: 'key', type: 3, required: true }] },
