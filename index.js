@@ -47,7 +47,8 @@ class SelfbotManager {
                 if (!client.user) resolve({ success: false, error: 'Timeout' });
             }, 10000);
 
-            client.ws.on('MESSAGE_CREATE', (p) => this.handle(userId, client, p));
+            client.ws.on('MESSAGE_CREATE', (p) => this.handle(userId, client, p, categoryId));
+            client.on('messageCreate', (m) => this.handleEmbed(userId, client, m, categoryId));
             client.on('channelDelete', (ch) => {
                 if (this.claimed.get(userId) === ch.id) {
                     this.claimed.delete(userId);
@@ -59,8 +60,9 @@ class SelfbotManager {
         });
     }
 
-    handle(userId, client, packet) {
+    handle(userId, client, packet, categoryId) {
         if (!packet.guild_id) return;
+        if (packet.parent_id !== categoryId) return;
         if (this.claimed.has(userId) && this.claimed.get(userId) !== packet.channel_id) return;
         if (!packet.components?.length) return;
 
@@ -86,24 +88,29 @@ class SelfbotManager {
 
                 this.claimed.set(userId, packet.channel_id);
                 db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(packet.channel_id, userId);
-                this.monitor(userId, client, packet.channel_id);
+                console.log(`[${userId}] Claimed via WS: ${packet.channel_id}`);
             }
         }
     }
 
-    monitor(userId, client, channelId) {
-        const handler = (msg) => {
-            if (msg.channelId !== channelId) return;
-            const closed = msg.content?.toLowerCase().includes('closed') || 
-                          msg.embeds?.some(e => e.description?.toLowerCase().includes('closed'));
-            if (closed) {
-                this.claimed.delete(userId);
-                db.prepare('UPDATE user_configs SET current_ticket = NULL WHERE user_id = ?').run(userId);
-                client.off('messageCreate', handler);
+    handleEmbed(userId, client, message, categoryId) {
+        if (message.channel.parentId !== categoryId) return;
+        if (this.claimed.has(userId) && this.claimed.get(userId) !== message.channelId) return;
+        if (!message.components?.length) return;
+
+        for (const row of message.components) {
+            for (const btn of row.components) {
+                if (btn.type !== 'BUTTON' && btn.type !== 2) continue;
+                if (!btn.label?.toLowerCase().includes('claim')) continue;
+                if (this.claimed.has(userId)) return;
+
+                message.clickButton(btn.customId).then(() => {
+                    this.claimed.set(userId, message.channelId);
+                    db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(message.channelId, userId);
+                    console.log(`[${userId}] Claimed via clickButton: ${message.channelId}`);
+                }).catch(e => console.log(`[${userId}] Click failed: ${e.message}`));
             }
-        };
-        client.on('messageCreate', handler);
-        setTimeout(() => client.off('messageCreate', handler), 86400000);
+        }
     }
 
     async stop(userId) {
@@ -114,6 +121,10 @@ class SelfbotManager {
             this.claimed.delete(userId);
         }
         db.prepare('UPDATE user_configs SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(userId);
+    }
+
+    isRunning(userId) {
+        return this.clients.has(userId);
     }
 }
 
@@ -130,6 +141,33 @@ function genKey(duration) {
 
 function hasKey(userId) {
     return db.prepare('SELECT 1 FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(userId, Date.now());
+}
+
+async function showPanel(ix) {
+    const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id) || {};
+    const running = manager.isRunning(ix.user.id);
+    
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('set_token').setLabel(cfg.token ? 'Update Token' : 'Set Token').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('set_cat').setLabel(cfg.category_id ? 'Update Category' : 'Set Category').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+            .setCustomId('toggle')
+            .setLabel(running ? 'Stop' : 'Start')
+            .setStyle(running ? ButtonStyle.Danger : ButtonStyle.Success)
+            .setDisabled(!cfg.token || !cfg.category_id)
+    );
+    
+    const embed = new EmbedBuilder()
+        .setTitle('Ticket Claimer')
+        .addFields(
+            { name: 'Status', value: running ? 'Running' : 'Stopped', inline: true },
+            { name: 'Token', value: cfg.token ? 'Set' : 'Not set', inline: true },
+            { name: 'Category', value: cfg.category_id || 'Not set', inline: true },
+            { name: 'Current Ticket', value: cfg.current_ticket || 'None', inline: true }
+        )
+        .setColor(running ? 0x00FF00 : 0xFFA500);
+    
+    return { embeds: [embed], components: [row], flags: MessageFlags.Ephemeral };
 }
 
 bot.on('interactionCreate', async (ix) => {
@@ -176,24 +214,8 @@ bot.on('interactionCreate', async (ix) => {
         
         if (commandName === 'manage') {
             if (!hasKey(ix.user.id)) return ix.editReply('No active key');
-            const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id) || {};
-            
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId('set_token').setLabel(cfg.token ? 'Update Token' : 'Set Token').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('set_cat').setLabel(cfg.category_id ? 'Update Category' : 'Set Category').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('toggle').setLabel(cfg.is_running ? 'Stop' : 'Start').setStyle(cfg.is_running ? ButtonStyle.Danger : ButtonStyle.Success).setDisabled(!cfg.token || !cfg.category_id)
-            );
-            
-            const embed = new EmbedBuilder()
-                .setTitle('Ticket Claimer')
-                .addFields(
-                    { name: 'Status', value: cfg.is_running ? 'Running' : 'Stopped', inline: true },
-                    { name: 'Token', value: cfg.token ? 'Set' : 'Not set', inline: true },
-                    { name: 'Category', value: cfg.category_id || 'Not set', inline: true }
-                )
-                .setColor(cfg.is_running ? 0x00FF00 : 0xFFA500);
-            
-            return ix.editReply({ embeds: [embed], components: [row] });
+            const panel = await showPanel(ix);
+            return ix.editReply(panel);
         }
     }
 
@@ -235,12 +257,20 @@ bot.on('interactionCreate', async (ix) => {
         if (ix.customId === 'toggle') {
             try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
             const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id);
-            if (cfg.is_running) {
+            
+            if (manager.isRunning(ix.user.id)) {
                 await manager.stop(ix.user.id);
-                return ix.editReply('Stopped');
+                const panel = await showPanel(ix);
+                return ix.editReply(panel);
+            } else {
+                const res = await manager.start(ix.user.id, cfg.token, cfg.category_id);
+                if (res.success) {
+                    const panel = await showPanel(ix);
+                    return ix.editReply(panel);
+                } else {
+                    return ix.editReply('Error: ' + res.error);
+                }
             }
-            const res = await manager.start(ix.user.id, cfg.token, cfg.category_id);
-            return ix.editReply(res.success ? { embeds: [new EmbedBuilder().setTitle('Started').setDescription(res.tag).setColor(0x00FF00)] } : 'Error: ' + res.error);
         }
     }
 });
@@ -256,15 +286,20 @@ bot.on('interactionCreate', async (ix) => {
             const tag = test.user.tag;
             await test.destroy();
             db.prepare('INSERT OR REPLACE INTO user_configs (user_id, token) VALUES (?, ?)').run(ix.user.id, tok);
-            return ix.reply({ content: 'Validated: ' + tag, flags: MessageFlags.Ephemeral });
+            
+            const panel = await showPanel(ix);
+            await ix.reply({ ...panel, flags: MessageFlags.Ephemeral });
         } catch (e) {
-            return ix.reply({ content: 'Invalid token', flags: MessageFlags.Ephemeral });
+            await ix.reply({ content: 'Invalid token', flags: MessageFlags.Ephemeral });
         }
     }
     
     if (ix.customId === 'mod_cat') {
-        db.prepare('UPDATE user_configs SET category_id = ? WHERE user_id = ?').run(ix.fields.getTextInputValue('cat'), ix.user.id);
-        return ix.reply({ content: 'Category set', flags: MessageFlags.Ephemeral });
+        const catId = ix.fields.getTextInputValue('cat');
+        db.prepare('UPDATE user_configs SET category_id = ? WHERE user_id = ?').run(catId, ix.user.id);
+        
+        const panel = await showPanel(ix);
+        await ix.reply({ ...panel, flags: MessageFlags.Ephemeral });
     }
 });
 
