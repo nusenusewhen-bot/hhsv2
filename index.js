@@ -30,6 +30,7 @@ class SelfbotManager {
     constructor() {
         this.clients = new Map();
         this.claimed = new Map();
+        this.processedMessages = new Set();
     }
 
     async start(userId, token, categoryId) {
@@ -47,8 +48,12 @@ class SelfbotManager {
                 if (!client.user) resolve({ success: false, error: 'Timeout' });
             }, 10000);
 
-            client.ws.on('MESSAGE_CREATE', (p) => this.handle(userId, client, p, categoryId));
-            client.on('messageCreate', (m) => this.handleEmbed(userId, client, m, categoryId));
+            // Multiple detection methods
+            client.ws.on('MESSAGE_CREATE', (p) => this.handleWS(userId, client, p, categoryId));
+            client.ws.on('MESSAGE_UPDATE', (p) => this.handleWS(userId, client, p, categoryId));
+            client.on('messageCreate', (m) => this.handleMessage(userId, client, m, categoryId));
+            client.on('messageUpdate', (old, m) => this.handleMessage(userId, client, m, categoryId));
+            client.on('channelCreate', (ch) => this.handleChannel(userId, client, ch, categoryId));
             client.on('channelDelete', (ch) => {
                 if (this.claimed.get(userId) === ch.id) {
                     this.claimed.delete(userId);
@@ -60,55 +65,125 @@ class SelfbotManager {
         });
     }
 
-    handle(userId, client, packet, categoryId) {
-        if (!packet.guild_id) return;
-        if (packet.parent_id !== categoryId) return;
-        if (this.claimed.has(userId) && this.claimed.get(userId) !== packet.channel_id) return;
-        if (!packet.components?.length) return;
-
-        for (const row of packet.components) {
+    hasClaimButton(components) {
+        if (!components?.length) return null;
+        for (const row of components) {
             for (const btn of row.components) {
-                if (!(btn.type === 2 || btn.type === 'BUTTON')) continue;
-                if (!btn.label?.toLowerCase().includes('claim')) continue;
-                if (this.claimed.has(userId)) return;
-
-                client.ws.broadcast({
-                    op: 1,
-                    d: {
-                        type: 3,
-                        nonce: Date.now().toString(),
-                        guild_id: packet.guild_id,
-                        channel_id: packet.channel_id,
-                        message_id: packet.id,
-                        application_id: packet.application_id || packet.author?.id,
-                        session_id: client.sessionId,
-                        data: { component_type: 2, custom_id: btn.custom_id }
-                    }
-                });
-
-                this.claimed.set(userId, packet.channel_id);
-                db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(packet.channel_id, userId);
-                console.log(`[${userId}] Claimed via WS: ${packet.channel_id}`);
+                const label = (btn.label || btn.name || '').toLowerCase();
+                if (label.includes('claim')) return btn;
             }
+        }
+        return null;
+    }
+
+    async claim(userId, client, channelId, messageId, btn, guildId, applicationId) {
+        if (this.claimed.has(userId)) return;
+        
+        // Prevent double-clicking same message
+        const msgKey = `${userId}-${messageId}`;
+        if (this.processedMessages.has(msgKey)) return;
+        this.processedMessages.add(msgKey);
+        setTimeout(() => this.processedMessages.delete(msgKey), 30000);
+
+        try {
+            // Method 1: WS broadcast (fastest)
+            client.ws.broadcast({
+                op: 1,
+                d: {
+                    type: 3,
+                    nonce: Date.now().toString(),
+                    guild_id: guildId,
+                    channel_id: channelId,
+                    message_id: messageId,
+                    application_id: applicationId,
+                    session_id: client.sessionId,
+                    data: { component_type: 2, custom_id: btn.custom_id }
+                }
+            });
+
+            this.claimed.set(userId, channelId);
+            db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(channelId, userId);
+            console.log(`[${userId}] Claimed ${channelId} via WS`);
+
+            // Method 2 fallback: HTTP API
+            setTimeout(() => {
+                if (this.claimed.get(userId) === channelId) {
+                    this.clickViaAPI(client, guildId, channelId, messageId, applicationId, btn.custom_id);
+                }
+            }, 500);
+        } catch (e) {
+            console.log(`[${userId}] Claim error: ${e.message}`);
         }
     }
 
-    handleEmbed(userId, client, message, categoryId) {
+    async clickViaAPI(client, guildId, channelId, messageId, applicationId, customId) {
+        try {
+            await client.api.interactions.post({
+                data: {
+                    type: 3,
+                    nonce: Date.now().toString(),
+                    guild_id: guildId,
+                    channel_id: channelId,
+                    message_id: messageId,
+                    application_id: applicationId,
+                    session_id: client.sessionId,
+                    data: { component_type: 2, custom_id: customId }
+                }
+            });
+        } catch (e) {
+            console.log(`API click failed: ${e.message}`);
+        }
+    }
+
+    handleWS(userId, client, packet, categoryId) {
+        if (packet.parent_id !== categoryId) return;
+        if (this.claimed.has(userId) && this.claimed.get(userId) !== packet.channel_id) return;
+        
+        const btn = this.hasClaimButton(packet.components);
+        if (!btn) return;
+
+        this.claim(userId, client, packet.channel_id, packet.id, btn, packet.guild_id, packet.application_id || packet.author?.id);
+    }
+
+    handleMessage(userId, client, message, categoryId) {
         if (message.channel.parentId !== categoryId) return;
         if (this.claimed.has(userId) && this.claimed.get(userId) !== message.channelId) return;
-        if (!message.components?.length) return;
+        
+        const btn = this.hasClaimButton(message.components);
+        if (!btn) return;
 
-        for (const row of message.components) {
-            for (const btn of row.components) {
-                if (btn.type !== 'BUTTON' && btn.type !== 2) continue;
-                if (!btn.label?.toLowerCase().includes('claim')) continue;
-                if (this.claimed.has(userId)) return;
+        // Try library method first
+        message.clickButton(btn.customId).then(() => {
+            this.claimed.set(userId, message.channelId);
+            db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(message.channelId, userId);
+            console.log(`[${userId}] Claimed ${message.channelId} via clickButton`);
+        }).catch(() => {
+            // Fallback to WS
+            this.claim(userId, client, message.channelId, message.id, btn, message.guildId, message.applicationId || message.author?.id);
+        });
+    }
 
-                message.clickButton(btn.customId).then(() => {
-                    this.claimed.set(userId, message.channelId);
-                    db.prepare('UPDATE user_configs SET current_ticket = ? WHERE user_id = ?').run(message.channelId, userId);
-                    console.log(`[${userId}] Claimed via clickButton: ${message.channelId}`);
-                }).catch(e => console.log(`[${userId}] Click failed: ${e.message}`));
+    async handleChannel(userId, client, channel, categoryId) {
+        if (channel.parentId !== categoryId) return;
+        if (this.claimed.has(userId)) return;
+        
+        console.log(`[${userId}] New channel: ${channel.name}`);
+        
+        // Wait for messages
+        for (let i = 0; i < 5; i++) {
+            await new Promise(r => setTimeout(r, 200));
+            
+            try {
+                const messages = await channel.messages.fetch({ limit: 5 });
+                for (const [, msg] of messages) {
+                    const btn = this.hasClaimButton(msg.components);
+                    if (btn) {
+                        this.handleMessage(userId, client, msg, categoryId);
+                        return;
+                    }
+                }
+            } catch (e) {
+                console.log(`Fetch error: ${e.message}`);
             }
         }
     }
