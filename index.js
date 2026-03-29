@@ -33,18 +33,17 @@ class SelfbotManager {
         this.client.once('ready', async () => {
             console.log(`[READY] ${this.userId} - ${this.client.user.tag}`);
             
-            // Hook into raw WebSocket events before library processing
             this.client.ws.on('MESSAGE_CREATE', (data) => {
                 if (data?.components?.length) {
                     this.rawComponents.set(data.id, data.components);
-                    console.log(`[RAW_CAPTURE] CREATE ${data.id} | ${data.components.length} rows`);
+                    console.log(`[RAW_CAPTURE] CREATE ${data.id}`);
                 }
             });
 
             this.client.ws.on('MESSAGE_UPDATE', (data) => {
                 if (data?.components?.length) {
                     this.rawComponents.set(data.id, data.components);
-                    console.log(`[RAW_CAPTURE] UPDATE ${data.id} | ${data.components.length} rows`);
+                    console.log(`[RAW_CAPTURE] UPDATE ${data.id}`);
                 }
             });
 
@@ -63,19 +62,15 @@ class SelfbotManager {
             });
 
             this.client.on('messageCreate', (msg) => {
-                console.log(`[MSG_CREATE] ${msg.channelId} | id: ${msg.id} | rawStored: ${this.rawComponents.has(msg.id)}`);
                 this.handleMessage(msg);
             });
             
             this.client.on('messageUpdate', (old, msg) => {
-                console.log(`[MSG_UPDATE] ${msg.channelId} | id: ${msg.id} | rawStored: ${this.rawComponents.has(msg.id)}`);
                 this.handleMessage(msg);
             });
             
             this.client.on('channelDelete', (ch) => {
-                console.log(`[CHANNEL_DELETE] ${ch.id}`);
                 if (this.currentTicket === ch.id) {
-                    console.log(`[RESET] Current ticket deleted`);
                     this.currentTicket = null;
                     this.claimedChannels.delete(ch.id);
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
@@ -87,68 +82,31 @@ class SelfbotManager {
     }
 
     async checkChannel(channelId) {
-        if (this.currentTicket) {
-            console.log(`[CHECK_SKIP] Already have ticket`);
-            return;
-        }
-        if (this.claimedChannels.has(channelId)) {
-            console.log(`[CHECK_SKIP] Already claimed this channel`);
-            return;
-        }
+        if (this.currentTicket) return;
+        if (this.claimedChannels.has(channelId)) return;
         
         try {
             const channel = await this.client.channels.fetch(channelId);
-            console.log(`[FETCHED] ${channelId} | name: ${channel.name}`);
             const messages = await channel.messages.fetch({ limit: 10 });
-            console.log(`[MESSAGES] Fetched ${messages.size} messages`);
             
             for (const [, msg] of messages) {
-                console.log(`[SCAN] ${msg.id} | author: ${msg.author?.tag} | components: ${msg.components?.length || 0} | rawStored: ${this.rawComponents.has(msg.id)}`);
-                if (this.handleMessage(msg)) {
-                    console.log(`[FOUND] Claim button found in history`);
-                    return;
-                }
+                if (this.handleMessage(msg)) return;
             }
-            console.log(`[NO_BUTTON] No claim button found in channel ${channelId}`);
         } catch (e) {
             console.log(`[ERROR] checkChannel: ${e.message}`);
         }
     }
 
     handleMessage(msg) {
-        if (msg.channel.parentId !== this.config.category_id) {
-            return false;
-        }
-        
-        if (this.currentTicket && this.currentTicket !== msg.channelId) {
-            console.log(`[SKIP_MSG] Have different ticket: ${this.currentTicket}`);
-            return false;
-        }
-        
-        if (this.claimedChannels.has(msg.channelId)) {
-            console.log(`[SKIP_MSG] Already claimed: ${msg.channelId}`);
-            return false;
-        }
+        if (msg.channel.parentId !== this.config.category_id) return false;
+        if (this.currentTicket && this.currentTicket !== msg.channelId) return false;
+        if (this.claimedChannels.has(msg.channelId)) return false;
         
         const key = `${msg.channelId}-${msg.id}`;
-        if (this.processed.has(key)) {
-            console.log(`[SKIP_MSG] Already processed: ${key}`);
-            return false;
-        }
-        
-        if (!msg.components?.length) {
-            return false;
-        }
+        if (this.processed.has(key)) return false;
+        if (!msg.components?.length) return false;
 
-        console.log(`[COMPONENTS] ${msg.components.length} rows in ${msg.id}`);
-
-        // Get raw component data from WebSocket capture
         const rawData = this.rawComponents.get(msg.id);
-        if (!rawData) {
-            console.log(`[WARN] No raw data stored for ${msg.id}`);
-        } else {
-            console.log(`[RAW_DATA] ${JSON.stringify(rawData)}`);
-        }
 
         for (let rowIdx = 0; rowIdx < msg.components.length; rowIdx++) {
             const row = msg.components[rowIdx];
@@ -158,45 +116,29 @@ class SelfbotManager {
                 const btn = row.components[btnIdx];
                 const rawBtn = rawRow?.components?.[btnIdx];
                 
-                // Extract custom_id from multiple sources
                 let customId = btn.custom_id || btn.customId || btn.data?.custom_id || rawBtn?.custom_id;
                 
                 const label = (btn.label || '').toLowerCase();
-                console.log(`[BUTTON] label: "${btn.label}" | extracted_id: ${customId} | raw_id: ${rawBtn?.custom_id} | disabled: ${btn.disabled}`);
                 
-                if (!label.includes('claim')) {
-                    console.log(`[SKIP_BTN] No 'claim' in label`);
-                    continue;
-                }
+                if (!label.includes('claim')) continue;
+                if (btn.disabled) continue;
                 
-                if (btn.disabled) {
-                    console.log(`[SKIP_BTN] Button disabled`);
-                    continue;
-                }
-                
-                if (!customId) {
-                    console.log(`[SKIP_BTN] No custom_id found`);
-                    // Last resort: try to find by label in raw data
-                    if (rawData) {
-                        for (const r of rawData) {
-                            for (const b of r.components || []) {
-                                if (b.label === btn.label && b.custom_id) {
-                                    customId = b.custom_id;
-                                    console.log(`[FOUND_RAW] ${customId}`);
-                                    break;
-                                }
+                if (!customId && rawData) {
+                    for (const r of rawData) {
+                        for (const b of r.components || []) {
+                            if (b.label === btn.label && b.custom_id) {
+                                customId = b.custom_id;
+                                break;
                             }
-                            if (customId) break;
                         }
+                        if (customId) break;
                     }
-                    if (!customId) continue;
                 }
                 
-                console.log(`[CLAIM_FOUND] ${btn.label} | ID: ${customId}`);
+                if (!customId) continue;
+                
                 this.processed.add(key);
                 this.claimViaWS(msg, customId);
-                
-                // Clean up raw storage
                 this.rawComponents.delete(msg.id);
                 return true;
             }
@@ -205,24 +147,14 @@ class SelfbotManager {
     }
 
     claimViaWS(message, customId) {
-        if (this.currentTicket) {
-            console.log(`[CLAIM_SKIP] Already have ticket: ${this.currentTicket}`);
-            return;
-        }
+        if (this.currentTicket) return;
+        if (this.claimedChannels.has(message.channelId)) return;
         
-        if (this.claimedChannels.has(message.channelId)) {
-            console.log(`[CLAIM_SKIP] Channel already claimed: ${message.channelId}`);
-            return;
-        }
-        
-        console.log(`[CLAIMING] Channel: ${message.channelId} | Button: ${customId}`);
-        
-        const nonce = Date.now().toString();
-        const payload = {
+        this.client.ws.broadcast({
             op: 1,
             d: {
                 type: 3,
-                nonce: nonce,
+                nonce: Date.now().toString(),
                 guild_id: message.guildId,
                 channel_id: message.channelId,
                 message_id: message.id,
@@ -233,11 +165,7 @@ class SelfbotManager {
                     custom_id: customId 
                 }
             }
-        };
-        
-        console.log(`[PAYLOAD] ${JSON.stringify(payload)}`);
-
-        this.client.ws.broadcast(payload);
+        });
 
         this.currentTicket = message.channelId;
         this.claimedChannels.add(message.channelId);
@@ -246,7 +174,6 @@ class SelfbotManager {
         
         setTimeout(() => {
             if (this.currentTicket === message.channelId) {
-                console.log(`[AUTO_RESET] Ticket timeout: ${message.channelId}`);
                 this.currentTicket = null;
                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
             }
@@ -254,7 +181,6 @@ class SelfbotManager {
     }
 
     stop() {
-        console.log(`[STOP] ${this.userId}`);
         if (this.client) {
             this.client.destroy();
             this.client = null;
@@ -285,11 +211,14 @@ async function buildPanel(userId) {
     const sb = activeSelfbots.get(userId);
     const running = sb?.client?.user ? true : false;
     
+    // Check if token actually exists in DB
+    const hasToken = !!user.token && user.token.length > 10;
+    
     const embed = new EmbedBuilder()
         .setTitle('🎫 Ticket Claimer')
         .addFields(
             { name: 'Status', value: running ? '🟢 Running' : '🔴 Stopped', inline: true },
-            { name: 'Token', value: user.token ? '✅ Set' : '❌ Not set', inline: true },
+            { name: 'Token', value: hasToken ? '✅ Set' : '❌ Not set', inline: true },
             { name: 'Category', value: user.category_id || '❌ Not set', inline: true },
             { name: 'Current', value: user.current_ticket || 'None', inline: true }
         )
@@ -298,7 +227,7 @@ async function buildPanel(userId) {
     const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId(`token_${userId}`).setLabel('🔐 Token').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId(`cat_${userId}`).setLabel('📁 Category').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('▶️ Start').setStyle(ButtonStyle.Success).setDisabled(!user.token || !user.category_id || running),
+        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('▶️ Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !user.category_id || running),
         new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel('🛑 Stop').setStyle(ButtonStyle.Danger).setDisabled(!running)
     );
 
@@ -310,7 +239,6 @@ bot.on('interactionCreate', async (ix) => {
         try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
 
         if (ix.user.id === OWNER_ID) {
-            // Owner commands
             if (ix.commandName === 'generatekey') {
                 const dur = ix.options.getString('duration') || 'lifetime';
                 const days = dur === 'lifetime' ? -1 : parseInt(dur);
@@ -360,7 +288,6 @@ bot.on('interactionCreate', async (ix) => {
             }
         }
 
-        // Owner gets lifetime auto - no key needed
         if (ix.commandName === 'redeemkey') {
             if (ix.user.id === OWNER_ID) {
                 db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
@@ -378,10 +305,8 @@ bot.on('interactionCreate', async (ix) => {
         }
         
         if (ix.commandName === 'manage') {
-            // Owner auto-lifetime check
             if (ix.user.id === OWNER_ID) {
                 db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
-                const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(ix.user.id);
                 const panel = await buildPanel(ix.user.id);
                 return ix.editReply(panel);
             }
@@ -445,11 +370,21 @@ bot.on('interactionCreate', async (ix) => {
 
         if (ix.customId.startsWith('mod_token_')) {
             await ix.deferReply({ flags: MessageFlags.Ephemeral });
-            const check = await validateToken(val);
-            if (!check.valid) return ix.editReply('❌ Invalid');
             
+            // Validate first
+            const check = await validateToken(val);
+            if (!check.valid) {
+                return ix.editReply('❌ Invalid token: ' + check.error);
+            }
+            
+            // Store token
             db.prepare('UPDATE users SET token = ? WHERE user_id = ?').run(val, uid);
-            return ix.editReply('✅ ' + check.tag);
+            console.log(`[TOKEN_SET] ${uid} -> ${check.tag}`);
+            
+            // Refresh panel immediately
+            const panel = await buildPanel(uid);
+            await ix.editReply({ content: `✅ Token set for ${check.tag}`, ...panel });
+            return;
         }
 
         if (ix.customId.startsWith('mod_cat_')) {
