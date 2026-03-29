@@ -1,87 +1,114 @@
-const { Client } = require('discord.js-selfbot-v13');
-const superProperties = require('./superprops');
+import discord
+from discord import app_commands
+from discord.ui import View, Button
+import os
+import asyncio
 
-const client = new Client({
-    checkUpdate: false,
-    patchVoice: true,
-    ws: {
-        properties: superProperties
-    },
-    // Aggressive caching for speed
-    messageCacheMaxSize: 100,
-    messageCacheLifetime: 0,
-    messageSweepInterval: 0
-});
+TOKEN = os.getenv('DISCORD_TOKEN')
+# HARDCODED: All tickets go to this category
+TICKET_CATEGORY_ID = 1485195520988418088
 
-const CATEGORY_ID = process.env.CATEGORY_ID;
-const USER_TOKEN = process.env.USER_TOKEN;
+class TicketBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.guilds = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
 
-// Pre-allocated nonce generator for speed
-let nonceCounter = BigInt(Date.now()) << BigInt(22);
-
-client.on('ready', () => {
-    console.log(`[READY] ${client.user.tag} | Monitoring: ${CATEGORY_ID}`);
-});
-
-// Raw WS handler for fastest possible detection
-client.ws.on('MESSAGE_CREATE', async (packet) => {
-    if (packet.guild_id && packet.channel_id) {
-        const channel = await client.channels.fetch(packet.channel_id).catch(() => null);
-        if (!channel || channel.parentId !== CATEGORY_ID) return;
+    async def on_ready(self):
+        print(f'✅ Bot logged in as {self.user}')
+        print(f'📁 Ticket Category ID: {TICKET_CATEGORY_ID}')
         
-        // Instant check for embeds with components
-        if (!packet.components || packet.components.length === 0) return;
+        # Sync commands to ALL guilds instantly
+        for guild in self.guilds:
+            try:
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                print(f'🔄 Synced {len(synced)} commands to {guild.name}')
+            except Exception as e:
+                print(f'❌ Failed to sync to {guild.name}: {e}')
         
-        // Fire all claim clicks immediately
-        for (const row of packet.components) {
-            for (const btn of row.components) {
-                if (btn.type === 2 && btn.label?.toLowerCase().includes('claim')) {
-                    fireClick(packet, btn);
-                }
-            }
-        }
-    }
-});
+        print('✅ Ready!')
 
-async function fireClick(packet, button) {
-    const nonce = (nonceCounter++).toString();
+client = TicketBot()
+
+class TicketPanel(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎫 Create Ticket", style=discord.ButtonStyle.primary, custom_id="create_ticket")
+    async def create_ticket(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.defer(ephemeral=True)
+        
+        category = interaction.guild.get_channel(TICKET_CATEGORY_ID)
+        if not category:
+            await interaction.followup.send("❌ Ticket category not found! Check bot permissions.", ephemeral=True)
+            return
+
+        # Create ticket channel
+        ticket_channel = await interaction.guild.create_text_channel(
+            name=f"ticket-{interaction.user.name}",
+            category=category,
+            topic=f"Ticket by {interaction.user.id}"
+        )
+
+        # Set permissions - user can see it, everyone else can't
+        await ticket_channel.set_permissions(interaction.guild.default_role, view_channel=False)
+        await ticket_channel.set_permissions(interaction.user, view_channel=True, send_messages=True, read_message_history=True)
+
+        # Send ticket message with Close and Claim buttons
+        embed = discord.Embed(
+            title="🎫 Support Ticket",
+            description=f"Ticket created by {interaction.user.mention}\n\nStaff can use the buttons below:",
+            color=discord.Color.blue()
+        )
+        
+        view = TicketControls(interaction.user.id)
+        await ticket_channel.send(embed=embed, view=view)
+        await ticket_channel.send(f"{interaction.user.mention} Welcome! Please describe your issue.")
+
+        await interaction.followup.send(f"✅ Ticket created: {ticket_channel.mention}", ephemeral=True)
+
+class TicketControls(View):
+    def __init__(self, creator_id):
+        super().__init__(timeout=None)
+        self.creator_id = creator_id
+        self.claimed_by = None
+
+    @discord.ui.button(label="🔒 Close", style=discord.ButtonStyle.danger, custom_id="close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("🔒 Closing ticket in 5 seconds...")
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
+
+    @discord.ui.button(label="👋 Claim", style=discord.ButtonStyle.success, custom_id="claim_ticket")
+    async def claim_ticket(self, interaction: discord.Interaction, button: Button):
+        if self.claimed_by:
+            await interaction.response.send_message(f"❌ Already claimed by {self.claimed_by.mention}", ephemeral=True)
+            return
+
+        self.claimed_by = interaction.user
+        button.disabled = True
+        button.label = f"Claimed by {interaction.user.name}"
+        
+        await interaction.response.edit_message(view=self)
+        await interaction.channel.send(f"👋 **Claimed by {interaction.user.mention}**")
+
+@client.tree.command(name="panel", description="Spawn the ticket creation panel")
+async def panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎫 Support Tickets",
+        description="Click the button below to create a support ticket!",
+        color=discord.Color.green()
+    )
     
-    const payload = {
-        type: 3,
-        nonce: nonce,
-        guild_id: packet.guild_id,
-        channel_id: packet.channel_id,
-        message_id: packet.id,
-        application_id: packet.application_id || packet.author?.id,
-        session_id: client.sessionId,
-        message_flags: packet.flags || 0,
-        data: {
-            component_type: 2,
-            custom_id: button.custom_id
-        }
-    };
+    view = TicketPanel()
+    await interaction.response.send_message(embed=embed, view=view)
 
-    // Direct WS send - no await, fire and forget
-    client.ws.broadcast({
-        op: 1,
-        d: payload
-    });
-    
-    console.log(`[CLAIM] ${nonce} | ${button.custom_id}`);
-}
-
-// Fallback message handler for cached messages
-client.on('messageCreate', async (message) => {
-    if (message.channel.parentId !== CATEGORY_ID) return;
-    if (!message.components?.length) return;
-    
-    for (const row of message.components) {
-        for (const btn of row.components) {
-            if (btn.type === 2 && btn.label?.toLowerCase().includes('claim')) {
-                message.clickButton(btn.customId).catch(() => {});
-            }
-        }
-    }
-});
-
-client.login(USER_TOKEN);
+if __name__ == "__main__":
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN not found in environment variables!")
+        print("Set DISCORD_TOKEN in Railway Variables")
+    else:
+        print("🚀 Starting bot...")
+        client.run(TOKEN)
