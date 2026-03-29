@@ -1,6 +1,6 @@
 {
-  "name": "ticket-claimer-system",
-  "version": "2.0.0",
+  "name": "ticket-claimer",
+  "version": "1.0.0",
   "main": "index.js",
   "dependencies": {
     "discord.js": "^14.14.1",
