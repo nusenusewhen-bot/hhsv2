@@ -33,23 +33,19 @@ class SelfbotManager {
         this.client.once('ready', async () => {
             console.log(`[READY] ${this.userId} - ${this.client.user.tag}`);
             
-            // Hook raw WebSocket to capture component data before library strips it
-            const originalHandler = this.client.ws.handlers.get('MESSAGE_CREATE');
-            this.client.ws.handlers.set('MESSAGE_CREATE', (packet, ...args) => {
-                if (packet.d?.components?.length) {
-                    this.rawComponents.set(packet.d.id, packet.d.components);
-                    console.log(`[RAW_STORED] ${packet.d.id} | ${packet.d.components.length} rows`);
+            // Hook into raw WebSocket events before library processing
+            this.client.ws.on('MESSAGE_CREATE', (data) => {
+                if (data?.components?.length) {
+                    this.rawComponents.set(data.id, data.components);
+                    console.log(`[RAW_CAPTURE] CREATE ${data.id} | ${data.components.length} rows`);
                 }
-                return originalHandler?.(packet, ...args);
             });
 
-            const originalUpdateHandler = this.client.ws.handlers.get('MESSAGE_UPDATE');
-            this.client.ws.handlers.set('MESSAGE_UPDATE', (packet, ...args) => {
-                if (packet.d?.components?.length) {
-                    this.rawComponents.set(packet.d.id, packet.d.components);
-                    console.log(`[RAW_UPDATE] ${packet.d.id} | ${packet.d.components.length} rows`);
+            this.client.ws.on('MESSAGE_UPDATE', (data) => {
+                if (data?.components?.length) {
+                    this.rawComponents.set(data.id, data.components);
+                    console.log(`[RAW_CAPTURE] UPDATE ${data.id} | ${data.components.length} rows`);
                 }
-                return originalUpdateHandler?.(packet, ...args);
             });
 
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
@@ -149,7 +145,9 @@ class SelfbotManager {
         // Get raw component data from WebSocket capture
         const rawData = this.rawComponents.get(msg.id);
         if (!rawData) {
-            console.log(`[WARN] No raw data stored for ${msg.id}, trying fallback extraction`);
+            console.log(`[WARN] No raw data stored for ${msg.id}`);
+        } else {
+            console.log(`[RAW_DATA] ${JSON.stringify(rawData)}`);
         }
 
         for (let rowIdx = 0; rowIdx < msg.components.length; rowIdx++) {
@@ -178,7 +176,20 @@ class SelfbotManager {
                 
                 if (!customId) {
                     console.log(`[SKIP_BTN] No custom_id found`);
-                    continue;
+                    // Last resort: try to find by label in raw data
+                    if (rawData) {
+                        for (const r of rawData) {
+                            for (const b of r.components || []) {
+                                if (b.label === btn.label && b.custom_id) {
+                                    customId = b.custom_id;
+                                    console.log(`[FOUND_RAW] ${customId}`);
+                                    break;
+                                }
+                            }
+                            if (customId) break;
+                        }
+                    }
+                    if (!customId) continue;
                 }
                 
                 console.log(`[CLAIM_FOUND] ${btn.label} | ID: ${customId}`);
@@ -299,6 +310,7 @@ bot.on('interactionCreate', async (ix) => {
         try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
 
         if (ix.user.id === OWNER_ID) {
+            // Owner commands
             if (ix.commandName === 'generatekey') {
                 const dur = ix.options.getString('duration') || 'lifetime';
                 const days = dur === 'lifetime' ? -1 : parseInt(dur);
@@ -348,7 +360,13 @@ bot.on('interactionCreate', async (ix) => {
             }
         }
 
+        // Owner gets lifetime auto - no key needed
         if (ix.commandName === 'redeemkey') {
+            if (ix.user.id === OWNER_ID) {
+                db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Owner Lifetime').setColor(0x00FF00)] });
+            }
+            
             const k = db.prepare('SELECT * FROM keys WHERE key = ? AND active = 1').get(ix.options.getString('key'));
             if (!k) return ix.editReply('❌ Invalid');
             if (k.redeemed_by) return ix.editReply('❌ Used');
@@ -360,6 +378,14 @@ bot.on('interactionCreate', async (ix) => {
         }
         
         if (ix.commandName === 'manage') {
+            // Owner auto-lifetime check
+            if (ix.user.id === OWNER_ID) {
+                db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
+                const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(ix.user.id);
+                const panel = await buildPanel(ix.user.id);
+                return ix.editReply(panel);
+            }
+            
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(ix.user.id);
             if (!user) return ix.editReply('❌ No key');
             const key = db.prepare('SELECT * FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(ix.user.id, Date.now());
