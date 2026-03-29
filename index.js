@@ -21,7 +21,6 @@ class SelfbotManager {
         this.config = config;
         this.client = null;
         this.currentTicket = config.current_ticket;
-        this.processed = new Set();
         this.newChannels = new Set();
         this.claimedChannels = new Set();
     }
@@ -31,37 +30,38 @@ class SelfbotManager {
         this.client = new SelfbotClient({ checkUpdate: false });
 
         this.client.once('ready', () => {
-            console.log(`[READY] ${this.userId} - ${this.client.user?.tag}`);
+            console.log(`[READY] ${this.userId}`);
             
+            // Hook raw WS events - before library processes them
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
-                console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id}`);
                 if (packet.parent_id !== this.config.category_id) {
-                    console.log(`[SKIP] Wrong category`);
+                    console.log(`[SKIP_CAT] ${packet.parent_id} != ${this.config.category_id}`);
                     return;
                 }
                 if (this.currentTicket) {
-                    console.log(`[SKIP] Have ticket`);
+                    console.log(`[SKIP_HAVE] ${this.currentTicket}`);
                     return;
                 }
                 
-                console.log(`[NEW] Tracking ${packet.id}`);
+                console.log(`[NEW_CH] ${packet.id}`);
                 this.newChannels.add(packet.id);
                 
-                setTimeout(() => this.checkChannel(packet.id), 100);
-                setTimeout(() => this.newChannels.delete(packet.id), 60000);
+                // Wait for message with components
+                setTimeout(() => this.scanChannel(packet.id), 500);
             });
 
-            this.client.on('messageCreate', (msg) => {
-                if (!this.newChannels.has(msg.channelId)) return;
-                console.log(`[MSG] ${msg.channelId} | comps: ${msg.components?.length || 0}`);
-                this.handleMessage(msg);
+            // Capture raw message data with components
+            this.client.on('raw', (packet) => {
+                if (packet.t === 'MESSAGE_CREATE' || packet.t === 'MESSAGE_UPDATE') {
+                    const data = packet.d;
+                    if (!data?.components?.length) return;
+                    if (!this.newChannels.has(data.channel_id)) return;
+                    
+                    console.log(`[RAW_MSG] ${data.channel_id} | comps: ${data.components.length}`);
+                    this.handleRawMessage(data);
+                }
             });
-            
-            this.client.on('messageUpdate', (old, msg) => {
-                if (!this.newChannels.has(msg.channelId)) return;
-                this.handleMessage(msg);
-            });
-            
+
             this.client.on('channelDelete', (ch) => {
                 this.newChannels.delete(ch.id);
                 this.claimedChannels.delete(ch.id);
@@ -75,101 +75,121 @@ class SelfbotManager {
         await this.client.login(this.config.token);
     }
 
-    async checkChannel(channelId) {
+    async scanChannel(channelId) {
         if (!this.newChannels.has(channelId)) return;
         if (this.currentTicket) return;
-        if (this.claimedChannels.has(channelId)) return;
         
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 5 });
+            const messages = await channel.messages.fetch({ limit: 3 });
             
             for (const [, msg] of messages) {
-                if (this.handleMessage(msg)) return;
+                // Force fetch raw data if components exist but custom_id missing
+                if (msg.components?.length) {
+                    for (const row of msg.components) {
+                        for (const btn of row.components) {
+                            if (!btn.custom_id && btn.label?.toLowerCase().includes('claim')) {
+                                console.log(`[FORCE_FETCH] ${msg.id}`);
+                                // Re-fetch single message to get full data
+                                const fresh = await channel.messages.fetch(msg.id, { force: true });
+                                if (fresh.components) {
+                                    for (const r of fresh.components) {
+                                        for (const b of r.components) {
+                                            if (b.custom_id && b.label?.toLowerCase().includes('claim')) {
+                                                this.clickClaim(msg, b.custom_id);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } catch (e) {
-            console.log(`[ERROR] ${e.message}`);
+            console.log(`[SCAN_ERR] ${e.message}`);
         }
     }
 
-    handleMessage(msg) {
-        if (!this.newChannels.has(msg.channelId)) return false;
-        if (msg.channel?.parentId !== this.config.category_id) return false;
-        if (this.currentTicket) return false;
-        if (this.claimedChannels.has(msg.channelId)) return false;
+    handleRawMessage(data) {
+        if (this.currentTicket) return;
+        if (this.claimedChannels.has(data.channel_id)) return;
         
-        const key = `${msg.channelId}-${msg.id}`;
-        if (this.processed.has(key)) return false;
-        if (!msg.components?.length) return false;
-
-        for (const row of msg.components) {
+        for (const row of data.components) {
             for (const btn of row.components) {
                 const label = (btn.label || '').toLowerCase();
                 
-                // STRICT: Only "claim" or "👋 claim"
-                const isClaim = label.includes('claim') && 
-                               !label.includes('token') && 
-                               !label.includes('category') &&
-                               !label.includes('start') && 
-                               !label.includes('stop') &&
-                               !label.includes('close');
-                
-                if (!isClaim) continue;
+                if (!label.includes('claim')) continue;
                 if (btn.disabled) continue;
-                if (!btn.custom_id) {
-                    console.log(`[SKIP] No custom_id`);
-                    continue;
-                }
+                if (!btn.custom_id) continue;
 
-                console.log(`[CLAIM] ${msg.channelId} | "${btn.label}" | ${btn.custom_id}`);
-                this.processed.add(key);
-                this.clickButton(msg, btn);
-                return true;
+                console.log(`[RAW_CLAIM] ${data.channel_id} | ${btn.label} | ${btn.custom_id}`);
+                
+                // Build minimal message-like object
+                const fakeMsg = {
+                    channelId: data.channel_id,
+                    guildId: data.guild_id,
+                    id: data.id,
+                    applicationId: data.application_id || data.author?.id
+                };
+                
+                this.clickClaim(fakeMsg, btn.custom_id);
+                this.newChannels.delete(data.channel_id);
+                return;
             }
         }
-        return false;
     }
 
-    async clickButton(message, btn) {
+    async clickClaim(messageLike, customId) {
+        if (this.currentTicket) return;
+        
         try {
-            // Use the library's built-in method
-            await message.clickButton(btn.custom_id);
-            console.log(`[CLICKED] ${btn.custom_id}`);
+            // Try library method first
+            const channel = await this.client.channels.fetch(messageLike.channelId);
+            const msg = await channel.messages.fetch(messageLike.id);
+            
+            if (msg.clickButton) {
+                await msg.clickButton(customId);
+                console.log(`[CLICKED_LIB] ${customId}`);
+            } else {
+                throw new Error('No clickButton');
+            }
         } catch (e) {
-            console.log(`[CLICK_ERROR] ${e.message}`);
-            // Fallback to WS broadcast
-            this.wsBroadcast(message, btn.custom_id);
+            console.log(`[CLICK_FALLBACK] ${e.message}`);
+            // Fallback to raw WS
+            this.wsBroadcast(messageLike, customId);
         }
         
-        this.currentTicket = message.channelId;
-        this.claimedChannels.add(message.channelId);
-        this.newChannels.delete(message.channelId);
+        this.currentTicket = messageLike.channelId;
+        this.claimedChannels.add(messageLike.channelId);
         
-        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
-        console.log(`[CLAIMED] ${this.userId} -> ${message.channelId}`);
+        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(messageLike.channelId, this.userId);
+        console.log(`[CLAIMED] ${this.userId} -> ${messageLike.channelId}`);
         
         setTimeout(() => {
-            if (this.currentTicket === message.channelId) {
+            if (this.currentTicket === messageLike.channelId) {
                 this.currentTicket = null;
                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
             }
         }, 300000);
     }
 
-    wsBroadcast(message, customId) {
+    wsBroadcast(msg, customId) {
         this.client.ws.broadcast({
             op: 1,
             d: {
                 type: 3,
                 nonce: Date.now().toString(),
-                guild_id: String(message.guildId),
-                channel_id: String(message.channelId),
-                message_id: String(message.id),
-                application_id: String(message.applicationId || message.author?.id),
+                guild_id: String(msg.guildId),
+                channel_id: String(msg.channelId),
+                message_id: String(msg.id),
+                application_id: String(msg.applicationId),
                 session_id: String(this.client.sessionId),
                 data: { component_type: 2, custom_id: String(customId) }
             }
         });
+        console.log(`[WS_SENT] ${customId}`);
     }
 
     stop() {
