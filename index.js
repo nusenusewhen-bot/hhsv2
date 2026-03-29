@@ -23,6 +23,7 @@ class SelfbotManager {
         this.currentTicket = config.current_ticket;
         this.processed = new Set();
         this.claimedChannels = new Set();
+        this.rawComponents = new Map();
     }
 
     async start() {
@@ -32,7 +33,25 @@ class SelfbotManager {
         this.client.once('ready', async () => {
             console.log(`[READY] ${this.userId} - ${this.client.user.tag}`);
             
-            // Monitor channel creates in specific category
+            // Hook raw WebSocket to capture component data before library strips it
+            const originalHandler = this.client.ws.handlers.get('MESSAGE_CREATE');
+            this.client.ws.handlers.set('MESSAGE_CREATE', (packet, ...args) => {
+                if (packet.d?.components?.length) {
+                    this.rawComponents.set(packet.d.id, packet.d.components);
+                    console.log(`[RAW_STORED] ${packet.d.id} | ${packet.d.components.length} rows`);
+                }
+                return originalHandler?.(packet, ...args);
+            });
+
+            const originalUpdateHandler = this.client.ws.handlers.get('MESSAGE_UPDATE');
+            this.client.ws.handlers.set('MESSAGE_UPDATE', (packet, ...args) => {
+                if (packet.d?.components?.length) {
+                    this.rawComponents.set(packet.d.id, packet.d.components);
+                    console.log(`[RAW_UPDATE] ${packet.d.id} | ${packet.d.components.length} rows`);
+                }
+                return originalUpdateHandler?.(packet, ...args);
+            });
+
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
                 console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id} | target: ${this.config.category_id}`);
                 if (packet.parent_id !== this.config.category_id) {
@@ -44,17 +63,16 @@ class SelfbotManager {
                     return;
                 }
                 console.log(`[CHECK] New ticket channel: ${packet.id}`);
-                setTimeout(() => this.checkChannel(packet.id), 100);
+                setTimeout(() => this.checkChannel(packet.id), 50);
             });
 
-            // Monitor all messages in category
             this.client.on('messageCreate', (msg) => {
-                console.log(`[MSG_CREATE] ${msg.channelId} | components: ${msg.components?.length || 0}`);
+                console.log(`[MSG_CREATE] ${msg.channelId} | id: ${msg.id} | rawStored: ${this.rawComponents.has(msg.id)}`);
                 this.handleMessage(msg);
             });
             
             this.client.on('messageUpdate', (old, msg) => {
-                console.log(`[MSG_UPDATE] ${msg.channelId} | components: ${msg.components?.length || 0}`);
+                console.log(`[MSG_UPDATE] ${msg.channelId} | id: ${msg.id} | rawStored: ${this.rawComponents.has(msg.id)}`);
                 this.handleMessage(msg);
             });
             
@@ -89,7 +107,7 @@ class SelfbotManager {
             console.log(`[MESSAGES] Fetched ${messages.size} messages`);
             
             for (const [, msg] of messages) {
-                console.log(`[SCAN] ${msg.id} | author: ${msg.author?.tag} | components: ${msg.components?.length || 0}`);
+                console.log(`[SCAN] ${msg.id} | author: ${msg.author?.tag} | components: ${msg.components?.length || 0} | rawStored: ${this.rawComponents.has(msg.id)}`);
                 if (this.handleMessage(msg)) {
                     console.log(`[FOUND] Claim button found in history`);
                     return;
@@ -102,18 +120,15 @@ class SelfbotManager {
     }
 
     handleMessage(msg) {
-        // Only process if in target category
         if (msg.channel.parentId !== this.config.category_id) {
             return false;
         }
         
-        // Skip if already handling a ticket (unless it's the current ticket)
         if (this.currentTicket && this.currentTicket !== msg.channelId) {
             console.log(`[SKIP_MSG] Have different ticket: ${this.currentTicket}`);
             return false;
         }
         
-        // Skip if already claimed this channel
         if (this.claimedChannels.has(msg.channelId)) {
             console.log(`[SKIP_MSG] Already claimed: ${msg.channelId}`);
             return false;
@@ -131,12 +146,26 @@ class SelfbotManager {
 
         console.log(`[COMPONENTS] ${msg.components.length} rows in ${msg.id}`);
 
-        for (const row of msg.components) {
-            for (const btn of row.components) {
-                console.log(`[BUTTON] label: "${btn.label}" | custom_id: ${btn.custom_id} | disabled: ${btn.disabled}`);
+        // Get raw component data from WebSocket capture
+        const rawData = this.rawComponents.get(msg.id);
+        if (!rawData) {
+            console.log(`[WARN] No raw data stored for ${msg.id}, trying fallback extraction`);
+        }
+
+        for (let rowIdx = 0; rowIdx < msg.components.length; rowIdx++) {
+            const row = msg.components[rowIdx];
+            const rawRow = rawData?.[rowIdx];
+            
+            for (let btnIdx = 0; btnIdx < row.components.length; btnIdx++) {
+                const btn = row.components[btnIdx];
+                const rawBtn = rawRow?.components?.[btnIdx];
+                
+                // Extract custom_id from multiple sources
+                let customId = btn.custom_id || btn.customId || btn.data?.custom_id || rawBtn?.custom_id;
                 
                 const label = (btn.label || '').toLowerCase();
-                // Check for claim/Claim in label
+                console.log(`[BUTTON] label: "${btn.label}" | extracted_id: ${customId} | raw_id: ${rawBtn?.custom_id} | disabled: ${btn.disabled}`);
+                
                 if (!label.includes('claim')) {
                     console.log(`[SKIP_BTN] No 'claim' in label`);
                     continue;
@@ -147,21 +176,24 @@ class SelfbotManager {
                     continue;
                 }
                 
-                if (!btn.custom_id) {
-                    console.log(`[SKIP_BTN] No custom_id`);
+                if (!customId) {
+                    console.log(`[SKIP_BTN] No custom_id found`);
                     continue;
                 }
                 
-                console.log(`[CLAIM_FOUND] ${btn.label} | ${btn.custom_id}`);
+                console.log(`[CLAIM_FOUND] ${btn.label} | ID: ${customId}`);
                 this.processed.add(key);
-                this.claimViaWS(msg, btn);
+                this.claimViaWS(msg, customId);
+                
+                // Clean up raw storage
+                this.rawComponents.delete(msg.id);
                 return true;
             }
         }
         return false;
     }
 
-    claimViaWS(message, btn) {
+    claimViaWS(message, customId) {
         if (this.currentTicket) {
             console.log(`[CLAIM_SKIP] Already have ticket: ${this.currentTicket}`);
             return;
@@ -172,28 +204,35 @@ class SelfbotManager {
             return;
         }
         
-        console.log(`[CLAIMING] Channel: ${message.channelId} | Button: ${btn.custom_id}`);
+        console.log(`[CLAIMING] Channel: ${message.channelId} | Button: ${customId}`);
         
-        this.client.ws.broadcast({
+        const nonce = Date.now().toString();
+        const payload = {
             op: 1,
             d: {
                 type: 3,
-                nonce: Date.now().toString(),
+                nonce: nonce,
                 guild_id: message.guildId,
                 channel_id: message.channelId,
                 message_id: message.id,
                 application_id: message.applicationId || message.author?.id,
                 session_id: this.client.sessionId,
-                data: { component_type: 2, custom_id: btn.custom_id }
+                data: { 
+                    component_type: 2, 
+                    custom_id: customId 
+                }
             }
-        });
+        };
+        
+        console.log(`[PAYLOAD] ${JSON.stringify(payload)}`);
+
+        this.client.ws.broadcast(payload);
 
         this.currentTicket = message.channelId;
         this.claimedChannels.add(message.channelId);
         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channelId, this.userId);
         console.log(`[CLAIMED] ${this.userId} -> ${message.channelId}`);
         
-        // Auto-reset after 5 minutes to allow new claims
         setTimeout(() => {
             if (this.currentTicket === message.channelId) {
                 console.log(`[AUTO_RESET] Ticket timeout: ${message.channelId}`);
@@ -211,6 +250,7 @@ class SelfbotManager {
         }
         this.currentTicket = null;
         this.claimedChannels.clear();
+        this.rawComponents.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
 }
