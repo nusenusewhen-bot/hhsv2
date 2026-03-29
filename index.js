@@ -167,7 +167,7 @@ async function showPanel(ix) {
         )
         .setColor(running ? 0x00FF00 : 0xFFA500);
     
-    return { embeds: [embed], components: [row], flags: MessageFlags.Ephemeral };
+    return { embeds: [embed], components: [row] };
 }
 
 bot.on('interactionCreate', async (ix) => {
@@ -288,9 +288,11 @@ bot.on('interactionCreate', async (ix) => {
             db.prepare('INSERT OR REPLACE INTO user_configs (user_id, token) VALUES (?, ?)').run(ix.user.id, tok);
             
             const panel = await showPanel(ix);
-            await ix.reply({ ...panel, flags: MessageFlags.Ephemeral });
+            await ix.deferReply({ flags: MessageFlags.Ephemeral });
+            await ix.editReply(panel);
         } catch (e) {
-            await ix.reply({ content: 'Invalid token', flags: MessageFlags.Ephemeral });
+            await ix.deferReply({ flags: MessageFlags.Ephemeral });
+            await ix.editReply({ content: 'Invalid token' });
         }
     }
     
@@ -299,7 +301,8 @@ bot.on('interactionCreate', async (ix) => {
         db.prepare('UPDATE user_configs SET category_id = ? WHERE user_id = ?').run(catId, ix.user.id);
         
         const panel = await showPanel(ix);
-        await ix.reply({ ...panel, flags: MessageFlags.Ephemeral });
+        await ix.deferReply({ flags: MessageFlags.Ephemeral });
+        await ix.editReply(panel);
     }
 });
 
