@@ -22,7 +22,6 @@ class SelfbotManager {
         this.client = null;
         this.currentTicket = config.current_ticket;
         this.processed = new Set();
-        this.rawComponents = new Map();
         this.newChannels = new Set();
         this.claimedChannels = new Set();
     }
@@ -32,20 +31,8 @@ class SelfbotManager {
         this.client = new SelfbotClient({ checkUpdate: false });
 
         this.client.once('ready', () => {
-            console.log(`[READY] ${this.userId}`);
+            console.log(`[READY] ${this.userId} - ${this.client.user?.tag}`);
             
-            this.client.ws.on('MESSAGE_CREATE', (data) => {
-                if (data?.components?.length) {
-                    this.rawComponents.set(data.id, data.components);
-                }
-            });
-
-            this.client.ws.on('MESSAGE_UPDATE', (data) => {
-                if (data?.components?.length) {
-                    this.rawComponents.set(data.id, data.components);
-                }
-            });
-
             this.client.ws.on('CHANNEL_CREATE', (packet) => {
                 console.log(`[CHANNEL_CREATE] ${packet.id} | parent: ${packet.parent_id}`);
                 if (packet.parent_id !== this.config.category_id) {
@@ -57,24 +44,16 @@ class SelfbotManager {
                     return;
                 }
                 
-                console.log(`[NEW] Tracking channel ${packet.id}`);
+                console.log(`[NEW] Tracking ${packet.id}`);
                 this.newChannels.add(packet.id);
                 
                 setTimeout(() => this.checkChannel(packet.id), 100);
-                
-                // Auto-cleanup after 60 seconds
-                setTimeout(() => {
-                    this.newChannels.delete(packet.id);
-                    console.log(`[CLEANUP] ${packet.id}`);
-                }, 60000);
+                setTimeout(() => this.newChannels.delete(packet.id), 60000);
             });
 
-            // ONLY process messages in NEW channels
             this.client.on('messageCreate', (msg) => {
-                if (!this.newChannels.has(msg.channelId)) {
-                    return;
-                }
-                console.log(`[MSG_NEW] ${msg.channelId} | components: ${msg.components?.length || 0}`);
+                if (!this.newChannels.has(msg.channelId)) return;
+                console.log(`[MSG] ${msg.channelId} | comps: ${msg.components?.length || 0}`);
                 this.handleMessage(msg);
             });
             
@@ -123,19 +102,11 @@ class SelfbotManager {
         if (this.processed.has(key)) return false;
         if (!msg.components?.length) return false;
 
-        const rawData = this.rawComponents.get(msg.id);
-
-        for (let r = 0; r < msg.components.length; r++) {
-            const row = msg.components[r];
-            const rawRow = rawData?.[r];
-            
-            for (let b = 0; b < row.components.length; b++) {
-                const btn = row.components[b];
-                const rawBtn = rawRow?.components?.[b];
-                
+        for (const row of msg.components) {
+            for (const btn of row.components) {
                 const label = (btn.label || '').toLowerCase();
                 
-                // STRICT claim detection
+                // STRICT: Only "claim" or "👋 claim"
                 const isClaim = label.includes('claim') && 
                                !label.includes('token') && 
                                !label.includes('category') &&
@@ -145,38 +116,31 @@ class SelfbotManager {
                 
                 if (!isClaim) continue;
                 if (btn.disabled) continue;
-                
-                const customId = rawBtn?.custom_id || btn.custom_id;
-                if (!customId) continue;
+                if (!btn.custom_id) {
+                    console.log(`[SKIP] No custom_id`);
+                    continue;
+                }
 
-                console.log(`[CLAIM] ${msg.channelId} | ${btn.label} | ${customId}`);
+                console.log(`[CLAIM] ${msg.channelId} | "${btn.label}" | ${btn.custom_id}`);
                 this.processed.add(key);
-                this.claimViaWS(msg, customId);
-                this.rawComponents.delete(msg.id);
-                this.newChannels.delete(msg.channelId);
+                this.clickButton(msg, btn);
                 return true;
             }
         }
         return false;
     }
 
-    claimViaWS(message, customId) {
-        if (this.currentTicket) return;
+    async clickButton(message, btn) {
+        try {
+            // Use the library's built-in method
+            await message.clickButton(btn.custom_id);
+            console.log(`[CLICKED] ${btn.custom_id}`);
+        } catch (e) {
+            console.log(`[CLICK_ERROR] ${e.message}`);
+            // Fallback to WS broadcast
+            this.wsBroadcast(message, btn.custom_id);
+        }
         
-        this.client.ws.broadcast({
-            op: 1,
-            d: {
-                type: 3,
-                nonce: Date.now().toString(),
-                guild_id: String(message.guildId),
-                channel_id: String(message.channelId),
-                message_id: String(message.id),
-                application_id: String(message.applicationId || message.author?.id),
-                session_id: String(this.client.sessionId),
-                data: { component_type: 2, custom_id: String(customId) }
-            }
-        });
-
         this.currentTicket = message.channelId;
         this.claimedChannels.add(message.channelId);
         this.newChannels.delete(message.channelId);
@@ -192,6 +156,22 @@ class SelfbotManager {
         }, 300000);
     }
 
+    wsBroadcast(message, customId) {
+        this.client.ws.broadcast({
+            op: 1,
+            d: {
+                type: 3,
+                nonce: Date.now().toString(),
+                guild_id: String(message.guildId),
+                channel_id: String(message.channelId),
+                message_id: String(message.id),
+                application_id: String(message.applicationId || message.author?.id),
+                session_id: String(this.client.sessionId),
+                data: { component_type: 2, custom_id: String(customId) }
+            }
+        });
+    }
+
     stop() {
         if (this.client) {
             this.client.destroy();
@@ -200,7 +180,6 @@ class SelfbotManager {
         this.currentTicket = null;
         this.newChannels.clear();
         this.claimedChannels.clear();
-        this.rawComponents.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
 }
