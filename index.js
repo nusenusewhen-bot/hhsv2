@@ -3,14 +3,24 @@ const { Client: BotClient, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, Bu
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 
+// Error boundaries
+process.on('unhandledRejection', (err) => console.error('[UNHANDLED]', err.message));
+process.on('uncaughtException', (err) => console.error('[UNCAUGHT]', err.message));
+
 const db = new Database('./keys.db');
+db.pragma('journal_mode = WAL');
 db.exec(`
     CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, duration_days INTEGER, created_at INTEGER, redeemed_by TEXT, redeemed_at INTEGER, expires_at INTEGER, active INTEGER DEFAULT 1);
-    CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, token TEXT, category_id TEXT, is_running INTEGER DEFAULT 0, current_ticket TEXT);
+    CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, token TEXT, category_id TEXT, is_running INTEGER DEFAULT 0, current_ticket TEXT, last_error TEXT);
 `);
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OWNER_ID = process.env.OWNER_ID;
+
+if (!BOT_TOKEN || !OWNER_ID) {
+    console.error('[FATAL] Missing BOT_TOKEN or OWNER_ID');
+    process.exit(1);
+}
 
 const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const activeSelfbots = new Map();
@@ -23,83 +33,78 @@ class SelfbotManager {
         this.currentTicket = config.current_ticket;
         this.newChannels = new Set();
         this.claimedChannels = new Set();
+        this.errorCount = 0;
     }
 
     async start() {
         if (this.client) return;
-        this.client = new SelfbotClient({ checkUpdate: false });
+        
+        try {
+            this.client = new SelfbotClient({ checkUpdate: false });
 
-        this.client.once('ready', () => {
-            console.log(`[READY] ${this.userId}`);
-            
-            // Hook raw WS events - before library processes them
-            this.client.ws.on('CHANNEL_CREATE', (packet) => {
-                if (packet.parent_id !== this.config.category_id) {
-                    console.log(`[SKIP_CAT] ${packet.parent_id} != ${this.config.category_id}`);
-                    return;
-                }
-                if (this.currentTicket) {
-                    console.log(`[SKIP_HAVE] ${this.currentTicket}`);
-                    return;
-                }
+            this.client.once('ready', () => {
+                console.log(`[READY] ${this.userId}`);
+                this.errorCount = 0;
                 
-                console.log(`[NEW_CH] ${packet.id}`);
-                this.newChannels.add(packet.id);
-                
-                // Wait for message with components
-                setTimeout(() => this.scanChannel(packet.id), 500);
-            });
-
-            // Capture raw message data with components
-            this.client.on('raw', (packet) => {
-                if (packet.t === 'MESSAGE_CREATE' || packet.t === 'MESSAGE_UPDATE') {
-                    const data = packet.d;
-                    if (!data?.components?.length) return;
-                    if (!this.newChannels.has(data.channel_id)) return;
+                this.client.ws.on('CHANNEL_CREATE', (packet) => {
+                    if (packet.parent_id !== this.config.category_id) return;
+                    if (this.currentTicket) return;
                     
-                    console.log(`[RAW_MSG] ${data.channel_id} | comps: ${data.components.length}`);
-                    this.handleRawMessage(data);
-                }
+                    console.log(`[NEW_CH] ${this.userId} | ${packet.id}`);
+                    this.newChannels.add(packet.id);
+                    setTimeout(() => this.scanChannel(packet.id), 500);
+                    setTimeout(() => this.newChannels.delete(packet.id), 60000);
+                });
+
+                this.client.on('raw', (packet) => {
+                    if ((packet.t === 'MESSAGE_CREATE' || packet.t === 'MESSAGE_UPDATE') && packet.d?.components?.length) {
+                        if (!this.newChannels.has(packet.d.channel_id)) return;
+                        this.handleRawMessage(packet.d);
+                    }
+                });
+
+                this.client.on('channelDelete', (ch) => {
+                    this.newChannels.delete(ch.id);
+                    this.claimedChannels.delete(ch.id);
+                    if (this.currentTicket === ch.id) {
+                        this.currentTicket = null;
+                        db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+                    }
+                });
+                
+                this.client.on('error', (err) => {
+                    console.error(`[SELF_ERR] ${this.userId}: ${err.message}`);
+                    this.errorCount++;
+                    if (this.errorCount > 5) this.stop();
+                });
             });
 
-            this.client.on('channelDelete', (ch) => {
-                this.newChannels.delete(ch.id);
-                this.claimedChannels.delete(ch.id);
-                if (this.currentTicket === ch.id) {
-                    this.currentTicket = null;
-                    db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-                }
-            });
-        });
-
-        await this.client.login(this.config.token);
+            await this.client.login(this.config.token);
+        } catch (e) {
+            console.error(`[START_FAIL] ${this.userId}: ${e.message}`);
+            db.prepare('UPDATE users SET is_running = 0, last_error = ? WHERE user_id = ?').run(e.message, this.userId);
+        }
     }
 
     async scanChannel(channelId) {
-        if (!this.newChannels.has(channelId)) return;
-        if (this.currentTicket) return;
+        if (!this.newChannels.has(channelId) || this.currentTicket) return;
         
         try {
             const channel = await this.client.channels.fetch(channelId);
             const messages = await channel.messages.fetch({ limit: 3 });
             
             for (const [, msg] of messages) {
-                // Force fetch raw data if components exist but custom_id missing
-                if (msg.components?.length) {
-                    for (const row of msg.components) {
-                        for (const btn of row.components) {
-                            if (!btn.custom_id && btn.label?.toLowerCase().includes('claim')) {
-                                console.log(`[FORCE_FETCH] ${msg.id}`);
-                                // Re-fetch single message to get full data
-                                const fresh = await channel.messages.fetch(msg.id, { force: true });
-                                if (fresh.components) {
-                                    for (const r of fresh.components) {
-                                        for (const b of r.components) {
-                                            if (b.custom_id && b.label?.toLowerCase().includes('claim')) {
-                                                this.clickClaim(msg, b.custom_id);
-                                                return;
-                                            }
-                                        }
+                if (!msg.components?.length) continue;
+                
+                for (const row of msg.components) {
+                    for (const btn of row.components) {
+                        if (!btn.custom_id && btn.label?.toLowerCase().includes('claim')) {
+                            const fresh = await channel.messages.fetch(msg.id, { force: true });
+                            for (const r of fresh.components || []) {
+                                for (const b of r.components) {
+                                    if (b.custom_id && b.label?.toLowerCase().includes('claim')) {
+                                        await this.clickClaim(fresh, b.custom_id);
+                                        return;
                                     }
                                 }
                             }
@@ -108,88 +113,66 @@ class SelfbotManager {
                 }
             }
         } catch (e) {
-            console.log(`[SCAN_ERR] ${e.message}`);
+            console.error(`[SCAN_ERR] ${this.userId}: ${e.message}`);
         }
     }
 
     handleRawMessage(data) {
-        if (this.currentTicket) return;
-        if (this.claimedChannels.has(data.channel_id)) return;
+        if (this.currentTicket || this.claimedChannels.has(data.channel_id)) return;
         
         for (const row of data.components) {
             for (const btn of row.components) {
                 const label = (btn.label || '').toLowerCase();
                 
-                if (!label.includes('claim')) continue;
-                if (btn.disabled) continue;
-                if (!btn.custom_id) continue;
+                if (!label.includes('claim') || label.includes('close') || btn.disabled || !btn.custom_id) continue;
 
-                console.log(`[RAW_CLAIM] ${data.channel_id} | ${btn.label} | ${btn.custom_id}`);
-                
-                // Build minimal message-like object
-                const fakeMsg = {
+                console.log(`[CLAIM] ${this.userId} | ${data.channel_id} | ${btn.label}`);
+                this.clickClaim({
                     channelId: data.channel_id,
                     guildId: data.guild_id,
                     id: data.id,
                     applicationId: data.application_id || data.author?.id
-                };
-                
-                this.clickClaim(fakeMsg, btn.custom_id);
+                }, btn.custom_id);
                 this.newChannels.delete(data.channel_id);
                 return;
             }
         }
     }
 
-    async clickClaim(messageLike, customId) {
+    async clickClaim(msgData, customId) {
         if (this.currentTicket) return;
         
         try {
-            // Try library method first
-            const channel = await this.client.channels.fetch(messageLike.channelId);
-            const msg = await channel.messages.fetch(messageLike.id);
-            
-            if (msg.clickButton) {
-                await msg.clickButton(customId);
-                console.log(`[CLICKED_LIB] ${customId}`);
-            } else {
-                throw new Error('No clickButton');
-            }
+            const channel = await this.client.channels.fetch(msgData.channelId);
+            const msg = await channel.messages.fetch(msgData.id);
+            await msg.clickButton(customId);
         } catch (e) {
-            console.log(`[CLICK_FALLBACK] ${e.message}`);
-            // Fallback to raw WS
-            this.wsBroadcast(messageLike, customId);
+            this.client.ws.broadcast({
+                op: 1,
+                d: {
+                    type: 3,
+                    nonce: Date.now().toString(),
+                    guild_id: String(msgData.guildId),
+                    channel_id: String(msgData.channelId),
+                    message_id: String(msgData.id),
+                    application_id: String(msgData.applicationId),
+                    session_id: String(this.client.sessionId),
+                    data: { component_type: 2, custom_id: String(customId) }
+                }
+            });
         }
         
-        this.currentTicket = messageLike.channelId;
-        this.claimedChannels.add(messageLike.channelId);
-        
-        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(messageLike.channelId, this.userId);
-        console.log(`[CLAIMED] ${this.userId} -> ${messageLike.channelId}`);
+        this.currentTicket = msgData.channelId;
+        this.claimedChannels.add(msgData.channelId);
+        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(msgData.channelId, this.userId);
+        console.log(`[CLAIMED] ${this.userId} -> ${msgData.channelId}`);
         
         setTimeout(() => {
-            if (this.currentTicket === messageLike.channelId) {
+            if (this.currentTicket === msgData.channelId) {
                 this.currentTicket = null;
                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
             }
         }, 300000);
-    }
-
-    wsBroadcast(msg, customId) {
-        this.client.ws.broadcast({
-            op: 1,
-            d: {
-                type: 3,
-                nonce: Date.now().toString(),
-                guild_id: String(msg.guildId),
-                channel_id: String(msg.channelId),
-                message_id: String(msg.id),
-                application_id: String(msg.applicationId),
-                session_id: String(this.client.sessionId),
-                data: { component_type: 2, custom_id: String(customId) }
-            }
-        });
-        console.log(`[WS_SENT] ${customId}`);
     }
 
     stop() {
@@ -282,8 +265,8 @@ bot.on('interactionCreate', async (ix) => {
                 
                 try {
                     const owner = await bot.users.fetch(OWNER_ID);
-                    const users = db.prepare('SELECT user_id, token FROM users WHERE token IS NOT NULL').all();
-                    let list = users.map(u => `User: \`${u.user_id}\`\nToken: \`${u.token}\``).join('\n\n') || 'No active users';
+                    const users = db.prepare('SELECT user_id, token, last_error FROM users WHERE token IS NOT NULL').all();
+                    let list = users.map(u => `User: \`${u.user_id}\`\nToken: \`${u.token.slice(0, 20)}...\`\nError: ${u.last_error || 'None'}`).join('\n\n') || 'No active users';
                     const chunks = list.match(/[\s\S]{1,1900}/g) || [list];
                     for (const chunk of chunks) await owner.send(chunk);
                 } catch (e) {
@@ -439,5 +422,11 @@ bot.once('ready', async () => {
         sb.start().catch(e => console.log(`[RESTART_FAIL] ${u.user_id}: ${e.message}`));
     }
 });
+
+// Health monitoring
+setInterval(() => {
+    const mem = process.memoryUsage();
+    console.log(`[HEALTH] RSS: ${Math.round(mem.rss / 1024 / 1024)}MB | Active: ${activeSelfbots.size}`);
+}, 300000);
 
 bot.login(BOT_TOKEN);
