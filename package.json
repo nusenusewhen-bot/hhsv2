@@ -1,10 +1,11 @@
 {
-  "name": "debug-claimer",
-  "version": "1.0.0",
+  "name": "ticket-claimer-system",
+  "version": "2.0.0",
   "main": "index.js",
   "dependencies": {
+    "discord.js": "^14.14.1",
     "discord.js-selfbot-v13": "3.3.0",
-    "axios": "^1.6.0"
+    "better-sqlite3": "^9.4.3"
   },
   "scripts": {
     "start": "node index.js"
