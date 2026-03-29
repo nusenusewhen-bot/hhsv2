@@ -1,5 +1,5 @@
 const { Client: SelfbotClient } = require('discord.js-selfbot-v13');
-const { Client: BotClient, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client: BotClient, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 
@@ -133,35 +133,33 @@ function hasKey(userId) {
 }
 
 bot.on('interactionCreate', async (ix) => {
-    if (ix.isCommand() || ix.isButton()) {
-        try { await ix.deferReply({ ephemeral: true }); } catch { return; }
-    }
-
-    if (ix.isCommand() && ix.user.id === OWNER_ID) {
-        const { commandName, options } = ix;
-        
-        if (commandName === 'generatekey') {
-            const dur = options.getString('duration');
-            const days = dur === 'lifetime' ? 'lifetime' : parseInt(dur);
-            const key = genKey(days);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('Key Generated').setDescription('`' + key + '`').setColor(0x00FF00)] });
-        }
-        
-        if (commandName === 'revokekey') {
-            db.prepare('UPDATE keys SET active = 0 WHERE key = ?').run(options.getString('key'));
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('Key Revoked').setColor(0xFF0000)] });
-        }
-        
-        if (commandName === 'revokeuser') {
-            const user = options.getUser('user');
-            db.prepare('UPDATE keys SET active = 0 WHERE redeemed_by = ?').run(user.id);
-            await manager.stop(user.id);
-            db.prepare('DELETE FROM user_configs WHERE user_id = ?').run(user.id);
-            return ix.editReply({ embeds: [new EmbedBuilder().setTitle('User Revoked').setColor(0xFF0000)] });
-        }
-    }
-
     if (ix.isCommand()) {
+        try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
+
+        if (ix.user.id === OWNER_ID) {
+            const { commandName, options } = ix;
+            
+            if (commandName === 'generatekey') {
+                const dur = options.getString('duration');
+                const days = dur === 'lifetime' ? 'lifetime' : parseInt(dur);
+                const key = genKey(days);
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('Key Generated').setDescription('`' + key + '`').setColor(0x00FF00)] });
+            }
+            
+            if (commandName === 'revokekey') {
+                db.prepare('UPDATE keys SET active = 0 WHERE key = ?').run(options.getString('key'));
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('Key Revoked').setColor(0xFF0000)] });
+            }
+            
+            if (commandName === 'revokeuser') {
+                const user = options.getUser('user');
+                db.prepare('UPDATE keys SET active = 0 WHERE redeemed_by = ?').run(user.id);
+                await manager.stop(user.id);
+                db.prepare('DELETE FROM user_configs WHERE user_id = ?').run(user.id);
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('User Revoked').setColor(0xFF0000)] });
+            }
+        }
+
         const { commandName, options } = ix;
         
         if (commandName === 'redeemkey') {
@@ -235,6 +233,7 @@ bot.on('interactionCreate', async (ix) => {
             });
         }
         if (ix.customId === 'toggle') {
+            try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
             const cfg = db.prepare('SELECT * FROM user_configs WHERE user_id = ?').get(ix.user.id);
             if (cfg.is_running) {
                 await manager.stop(ix.user.id);
@@ -257,15 +256,15 @@ bot.on('interactionCreate', async (ix) => {
             const tag = test.user.tag;
             await test.destroy();
             db.prepare('INSERT OR REPLACE INTO user_configs (user_id, token) VALUES (?, ?)').run(ix.user.id, tok);
-            return ix.reply({ content: 'Validated: ' + tag, ephemeral: true });
+            return ix.reply({ content: 'Validated: ' + tag, flags: MessageFlags.Ephemeral });
         } catch (e) {
-            return ix.reply({ content: 'Invalid token', ephemeral: true });
+            return ix.reply({ content: 'Invalid token', flags: MessageFlags.Ephemeral });
         }
     }
     
     if (ix.customId === 'mod_cat') {
         db.prepare('UPDATE user_configs SET category_id = ? WHERE user_id = ?').run(ix.fields.getTextInputValue('cat'), ix.user.id);
-        return ix.reply({ content: 'Category set', ephemeral: true });
+        return ix.reply({ content: 'Category set', flags: MessageFlags.Ephemeral });
     }
 });
 
