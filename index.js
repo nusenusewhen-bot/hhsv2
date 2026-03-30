@@ -52,7 +52,7 @@ class SelfbotManager {
                     
                     console.log(`[NEW_CH] ${this.userId} | ${packet.id}`);
                     this.newChannels.add(packet.id);
-                    setTimeout(() => this.scanChannel(packet.id), 500);
+                    setTimeout(() => this.scanChannel(packet.id), 300);
                     setTimeout(() => this.newChannels.delete(packet.id), 60000);
                 });
 
