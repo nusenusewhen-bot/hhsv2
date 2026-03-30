@@ -91,7 +91,7 @@ class SelfbotManager {
         
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 3 });
+            const messages = await channel.messages.fetch({ limit: 1 });
             
             for (const [, msg] of messages) {
                 if (!msg.components?.length) continue;
