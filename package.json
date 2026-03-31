@@ -1,13 +1,31 @@
 {
-  "name": "ticket-claimer",
+  "name": "ticket-claimer-bot",
   "version": "1.0.0",
+  "description": "Puppeteer-based ticket claimer with Discord.js bot interface",
   "main": "index.js",
-  "dependencies": {
-    "discord.js": "^14.14.1",
-    "discord.js-selfbot-v13": "3.3.0",
-    "better-sqlite3": "^9.4.3"
-  },
   "scripts": {
-    "start": "node index.js"
-  }
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "discord.js": "^14.14.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "discord",
+    "ticket",
+    "claimer",
+    "puppeteer",
+    "selfbot"
+  ],
+  "author": "",
+  "license": "MIT"
 }
