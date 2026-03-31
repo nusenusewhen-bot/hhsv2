@@ -45,7 +45,7 @@ class SelfbotManager {
                 console.log(`[READY] ${this.userId}`);
                 this.errorCount = 0;
                 
-                // Monitor ALL messages in category
+                // Listen for new messages in category
                 this.client.on('messageCreate', async (message) => {
                     if (message.channel.parentId !== this.config.category_id) return;
                     if (this.currentTicket) return;
@@ -53,11 +53,12 @@ class SelfbotManager {
                     if (this.processingChannels.has(message.channel.id)) return;
                     
                     if (message.components?.length > 0) {
-                        console.log(`[MSG_CREATE] ${this.userId} | ${message.channel.id} | buttons found`);
+                        console.log(`[MSG_CREATE] ${this.userId} | ${message.channel.id} | components: ${message.components.length}`);
                         await this.tryClickClaim(message);
                     }
                 });
 
+                // Listen for message updates (buttons added to existing messages)
                 this.client.on('messageUpdate', async (_, message) => {
                     if (message.channel.parentId !== this.config.category_id) return;
                     if (this.currentTicket) return;
@@ -65,19 +66,19 @@ class SelfbotManager {
                     if (this.processingChannels.has(message.channel.id)) return;
                     
                     if (message.components?.length > 0) {
-                        console.log(`[MSG_UPDATE] ${this.userId} | ${message.channel.id} | buttons found`);
+                        console.log(`[MSG_UPDATE] ${this.userId} | ${message.channel.id} | components: ${message.components.length}`);
                         await this.tryClickClaim(message);
                     }
                 });
 
-                // Also catch channel creates (tickets created empty then populated)
+                // Handle new ticket channels
                 this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                     if (packet.parent_id !== this.config.category_id) return;
                     if (this.currentTicket) return;
                     
                     console.log(`[NEW_CH] ${this.userId} | ${packet.id}`);
                     
-                    // Wait for message to appear
+                    // Wait a bit for the initial message to be sent
                     setTimeout(async () => {
                         try {
                             const channel = await this.client.channels.fetch(packet.id);
@@ -85,14 +86,15 @@ class SelfbotManager {
                             
                             for (const [, msg] of messages) {
                                 if (msg.components?.length > 0) {
+                                    console.log(`[SCAN] Found message with buttons in ${packet.id}`);
                                     await this.tryClickClaim(msg);
                                     if (this.currentTicket) break;
                                 }
                             }
                         } catch (e) {
-                            console.error(`[FETCH_ERR] ${this.userId}: ${e.message}`);
+                            console.error(`[SCAN_ERR] ${this.userId}: ${e.message}`);
                         }
-                    }, 500);
+                    }, 1000);
                 });
 
                 this.client.on('channelDelete', (ch) => {
@@ -126,30 +128,49 @@ class SelfbotManager {
         this.processingChannels.add(message.channel.id);
         
         try {
-            for (const row of message.components) {
-                for (const btn of row.components) {
+            // Iterate through all action rows
+            for (let rowIndex = 0; rowIndex < message.components.length; rowIndex++) {
+                const row = message.components[rowIndex];
+                
+                // Iterate through all components in the row
+                for (let btnIndex = 0; btnIndex < row.components.length; btnIndex++) {
+                    const btn = row.components[btnIndex];
+                    
+                    // Must be a button (type 2)
+                    if (btn.type !== 2) continue;
+                    
                     const label = (btn.label || '').toLowerCase();
                     
-                    // Check for claim button
+                    // Skip if not claim button
                     if (!label.includes('claim')) continue;
                     if (label.includes('close')) continue;
                     if (btn.disabled) continue;
                     if (!btn.custom_id) continue;
 
-                    console.log(`[CLICKING] ${this.userId} | ${btn.custom_id} | ${btn.label}`);
+                    console.log(`[FOUND] ${this.userId} | Row ${rowIndex} Btn ${btnIndex} | ${btn.custom_id} | "${btn.label}"`);
                     
                     try {
-                        // Method 1: Direct clickButton
-                        await message.clickButton(btn.custom_id);
-                        console.log(`[CLICKED_OK] ${this.userId} | ${message.channel.id}`);
+                        // Method 1: Use the button's click method directly
+                        if (btn.click) {
+                            await btn.click();
+                            console.log(`[CLICKED_V1] ${this.userId} | ${message.channel.id}`);
+                        } 
+                        // Method 2: Use message.clickButton with custom_id
+                        else if (message.clickButton) {
+                            await message.clickButton(btn.custom_id);
+                            console.log(`[CLICKED_V2] ${this.userId} | ${message.channel.id}`);
+                        }
+                        // Method 3: Raw HTTP fallback
+                        else {
+                            throw new Error('No click method available');
+                        }
                     } catch (clickErr) {
                         console.error(`[CLICK_ERR] ${this.userId}: ${clickErr.message}`);
                         
-                        // Method 2: Raw WS broadcast as fallback
+                        // Fallback: Manual HTTP request via client.api
                         try {
-                            this.client.ws.broadcast({
-                                op: 1,
-                                d: {
+                            await this.client.api.interactions.post({
+                                data: {
                                     type: 3,
                                     nonce: Date.now().toString(),
                                     guild_id: message.guildId,
@@ -163,14 +184,14 @@ class SelfbotManager {
                                     }
                                 }
                             });
-                            console.log(`[WS_SENT] ${this.userId} | ${message.channel.id}`);
-                        } catch (wsErr) {
-                            console.error(`[WS_ERR] ${this.userId}: ${wsErr.message}`);
+                            console.log(`[CLICKED_V3] ${this.userId} | ${message.channel.id} (API fallback)`);
+                        } catch (apiErr) {
+                            console.error(`[API_ERR] ${this.userId}: ${apiErr.message}`);
                             continue;
                         }
                     }
                     
-                    // Mark as claimed regardless (optimistic)
+                    // Mark as claimed
                     this.currentTicket = message.channel.id;
                     this.claimedChannels.add(message.channel.id);
                     db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
@@ -189,7 +210,7 @@ class SelfbotManager {
                 }
             }
         } finally {
-            setTimeout(() => this.processingChannels.delete(message.channel.id), 1000);
+            setTimeout(() => this.processingChannels.delete(message.channel.id), 2000);
         }
     }
 
