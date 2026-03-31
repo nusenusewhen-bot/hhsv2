@@ -6,7 +6,6 @@ const { Client: BotClient, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, Bu
 
 puppeteer.use(StealthPlugin());
 
-// Database setup
 const db = new Database('./keys.db');
 db.pragma('journal_mode = WAL');
 db.exec(`
@@ -44,7 +43,7 @@ class PuppeteerClaimer {
         
         try {
             this.browser = await puppeteer.launch({
-                headless: true, // Set to false for debugging
+                headless: true,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
@@ -55,37 +54,37 @@ class PuppeteerClaimer {
                 ]
             });
 
-            // Store browser PID for cleanup
             const pid = this.browser.process().pid;
             db.prepare('UPDATE users SET browser_pid = ? WHERE user_id = ?').run(pid, this.userId);
 
             this.page = await this.browser.newPage();
             
-            // Set user agent to look like real Discord client
             await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
             
-            // Inject token before loading
-            await this.page.goto('https://discord.com/login', { waitUntil: 'networkidle0' });
+            // Fixed: Wait for page to be fully loaded before injecting token
+            await this.page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded' });
             
-            await this.page.evaluate((token) => {
-                window.localStorage.setItem('token', `"${token}"`);
+            // Fixed: Wait for document.body to exist, then inject token
+            await this.page.waitForFunction(() => document.readyState === 'complete');
+            
+            // Fixed: Use evaluateOnNewDocument to ensure localStorage is available
+            await this.page.evaluateOnNewDocument((token) => {
+                localStorage.setItem('token', `"${token}"`);
             }, this.token);
-
-            // Reload to apply token
-            await this.page.reload({ waitUntil: 'networkidle0' });
             
-            // Wait for Discord to fully load
-            await this.page.waitForSelector('nav[aria-label="Servers sidebar"]', { timeout: 30000 });
+            // Reload to apply token
+            await this.page.reload({ waitUntil: 'networkidle2' });
+            
+            // Fixed: Wait for Discord's actual UI with multiple possible selectors
+            await this.page.waitForSelector('nav[aria-label="Servers sidebar"], [class*="guilds"], [class*="sidebar"]', { timeout: 30000 });
             
             console.log(`[PUPPETEER_READY] ${this.userId} - Logged in`);
             this.isRunning = true;
             
-            // Navigate to guild if specified
             if (this.guildId) {
                 await this.navigateToGuild();
             }
             
-            // Start monitoring
             this.startMonitoring();
             
             db.prepare('UPDATE users SET is_running = 1, last_error = NULL WHERE user_id = ?').run(this.userId);
@@ -99,7 +98,6 @@ class PuppeteerClaimer {
 
     async navigateToGuild() {
         try {
-            // Click on guild by ID (via data-list-item-id attribute)
             const guildSelector = `div[data-list-item-id="guildsnav___${this.guildId}"]`;
             await this.page.waitForSelector(guildSelector, { timeout: 10000 });
             await this.page.click(guildSelector);
@@ -121,33 +119,25 @@ class PuppeteerClaimer {
             } catch (e) {
                 console.error(`[MONITOR_ERR] ${this.userId}: ${e.message}`);
             }
-        }, 800); // 800ms check interval (safer than 300ms)
+        }, 800);
     }
 
     async checkForTickets() {
-        // Look for channels in the category that have unclaimed ticket buttons
         const tickets = await this.page.$$eval(
             `[data-list-item-id*="channels___"]:has([class*="channelName"])`,
-            (channels, targetCategoryId) => {
+            (channels) => {
                 return channels.map(ch => {
-                    // Check if this channel is in our target category
-                    const categoryAttr = ch.getAttribute('data-dnd-name') || '';
                     const channelId = ch.getAttribute('data-list-item-id')?.replace('channels___', '');
                     const channelName = ch.querySelector('[class*="channelName"]')?.innerText || '';
-                    
-                    // Look for any buttons in this channel row (indicates ticket bot)
                     const hasButton = ch.querySelector('button, [role="button"]') !== null;
                     
                     return {
                         channelId,
                         channelName,
-                        element: ch.outerHTML,
-                        hasButton,
-                        categoryAttr
+                        hasButton
                     };
                 }).filter(t => t.hasButton && !t.channelName.includes('closed') && !t.channelName.includes('archived'));
-            },
-            this.categoryId
+            }
         );
 
         for (const ticket of tickets) {
@@ -156,11 +146,9 @@ class PuppeteerClaimer {
 
             console.log(`[FOUND_TICKET] ${ticket.channelName} (${ticket.channelId})`);
             
-            // Click the channel to open it
             await this.page.click(`[data-list-item-id="channels___${ticket.channelId}"]`);
             await this.page.waitForTimeout(500);
             
-            // Now look for claim buttons in the message area
             const claimed = await this.findAndClickClaimButton();
             
             if (claimed) {
@@ -170,7 +158,6 @@ class PuppeteerClaimer {
                 
                 console.log(`[CLAIMED] ${this.userId} -> ${ticket.channelName}`);
                 
-                // Auto-release after 2 minutes
                 setTimeout(() => {
                     this.currentTicket = null;
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
@@ -183,9 +170,6 @@ class PuppeteerClaimer {
     }
 
     async findAndClickClaimButton() {
-        // Multiple strategies to find claim buttons
-        
-        // Strategy 1: Look for button with "claim" text
         const claimButton = await this.page.$eval(
             'button:has-text("Claim"):not([disabled]), button:has-text("CLAIM"):not([disabled]), button:has-text("claim"):not([disabled])',
             btn => ({ text: btn.innerText, found: true })
@@ -198,7 +182,6 @@ class PuppeteerClaimer {
             return true;
         }
 
-        // Strategy 2: Look for any button in message components area
         const buttons = await this.page.$$eval(
             '[class*="message"] button:not([disabled]), [class*="embed"] button:not([disabled])',
             btns => btns.map(b => ({
@@ -214,7 +197,6 @@ class PuppeteerClaimer {
             if (/(claim|accept|take|open|get)/i.test(text) && !/(close|delete|end)/i.test(text)) {
                 console.log(`[FOUND_BTN] Index ${i}: ${text}`);
                 
-                // Click by index
                 const clickSuccess = await this.page.evaluate((index) => {
                     const btns = document.querySelectorAll('[class*="message"] button:not([disabled]), [class*="embed"] button:not([disabled])');
                     if (btns[index]) {
@@ -231,7 +213,6 @@ class PuppeteerClaimer {
             }
         }
 
-        // Strategy 3: Look for specific emoji buttons (🎫, ✅, etc.)
         const emojiButtons = await this.page.$$eval(
             'button:has(img[alt="🎫"]):not([disabled]), button:has(img[alt="✅"]):not([disabled]), button:has(img[alt="📩"]):not([disabled])',
             btns => btns.length
@@ -263,7 +244,6 @@ class PuppeteerClaimer {
             try {
                 this.browser.close();
             } catch (e) {
-                // Force kill if needed
                 const pid = db.prepare('SELECT browser_pid FROM users WHERE user_id = ?').get(this.userId)?.browser_pid;
                 if (pid) {
                     try { process.kill(pid, 'SIGKILL'); } catch {}
@@ -279,9 +259,7 @@ class PuppeteerClaimer {
     }
 }
 
-// Bot command handlers (same as before but using PuppeteerClaimer)
 async function validateToken(token) {
-    // Quick validation - try to get user info
     try {
         const response = await fetch('https://discord.com/api/v9/users/@me', {
             headers: { 'Authorization': token }
@@ -326,7 +304,6 @@ async function buildPanel(userId) {
     return { embeds: [embed], components: [row] };
 }
 
-// Bot event handlers
 bot.on('interactionCreate', async (ix) => {
     if (ix.isCommand()) {
         try { await ix.deferReply({ ephemeral: true }); } catch { return; }
@@ -436,7 +413,6 @@ bot.on('interactionCreate', async (ix) => {
                 return ix.editReply({ content: '❌ Missing token or category', embeds: [], components: [] });
             }
             
-            // Stop existing if any
             const existing = activeClaimers.get(uid);
             if (existing) existing.stop();
             
@@ -529,7 +505,6 @@ bot.once('ready', async () => {
         { name: 'manage', description: 'Open control panel' }
     ]);
 
-    // Clean up any orphaned browser processes
     const running = db.prepare('SELECT * FROM users WHERE is_running = 1').all();
     for (const u of running) {
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL, browser_pid = NULL WHERE user_id = ?').run(u.user_id);
@@ -538,7 +513,6 @@ bot.once('ready', async () => {
     console.log(`[READY] Cleaned up ${running.length} stale entries`);
 });
 
-// Cleanup on exit
 process.on('SIGINT', () => {
     console.log('[SHUTDOWN] Cleaning up...');
     for (const [uid, claimer] of activeClaimers) {
