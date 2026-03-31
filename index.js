@@ -120,7 +120,7 @@ class SelfbotManager {
     startPolling() {
         console.log(`[POLLING_STARTED] ${this.userId} | category: ${this.config.category_id}`);
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 300); // Fixed: 300ms instead of 100ms
+        this.pollInterval = setInterval(() => this.doPoll(), 300);
     }
 
     async doPoll() {
@@ -141,7 +141,6 @@ class SelfbotManager {
                     continue;
                 }
                 
-                // Fixed: Use isTextBased() instead of type === 0
                 const categoryChannels = allChannels.filter(ch => {
                     const match = ch.parentId === this.config.category_id && ch.isTextBased();
                     if (match) console.log(`[FOUND_CH] ${ch.name} | ${ch.id} | type: ${ch.type} | isText: ${ch.isTextBased()}`);
@@ -184,7 +183,6 @@ class SelfbotManager {
                 return;
             }
             
-            // Fixed: Small delay for channel readiness
             await new Promise(r => setTimeout(r, 500));
             
             console.log(`[FETCH_MSGS] ${channelId}`);
@@ -192,7 +190,6 @@ class SelfbotManager {
             console.log(`[FETCHED] ${channelId} | ${messages.size} messages`);
             
             for (const [, msg] of messages) {
-                // Fixed: Reduced skip window from 3000ms to 500ms
                 const lastChecked = this.lastCheckedMessages.get(msg.id);
                 if (lastChecked && Date.now() - lastChecked < 500) continue;
                 this.lastCheckedMessages.set(msg.id, Date.now());
@@ -204,7 +201,6 @@ class SelfbotManager {
                     }
                 }
                 
-                // Fixed: Check both .length and .size for components
                 const hasComponents = (msg.components?.length > 0) || (msg.components?.size > 0);
                 console.log(`[CHECK_MSG] ${msg.id} | hasComponents: ${hasComponents}`);
                 
@@ -237,19 +233,16 @@ class SelfbotManager {
         }
         
         try {
-            // Fixed: Handle both Collection and Array
             let components = message.components;
             if (!components || (components.length === 0 && components.size === 0)) {
                 console.log(`[NO_COMPONENTS] ${message.id}`);
                 return false;
             }
             
-            // Convert Collection to Array if needed
             const rows = components.values ? Array.from(components.values()) : components;
             
             for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
                 const row = rows[rowIdx];
-                // Fixed: Handle nested components properly
                 let buttons = row.components;
                 if (buttons?.values) buttons = Array.from(buttons.values());
                 else if (!Array.isArray(buttons)) buttons = [];
@@ -262,7 +255,6 @@ class SelfbotManager {
                     const btn = buttons[btnIdx];
                     if (!btn) continue;
                     
-                    // Fixed: Robust property access (API uses camelCase)
                     const rawLabel = (btn.label || btn.text || '').toString().toLowerCase();
                     const customId = btn.customId || btn.custom_id;
                     const isDisabled = btn.disabled === true;
@@ -270,19 +262,16 @@ class SelfbotManager {
                     
                     console.log(`[CHECK_BTN] ${btnIdx} | type: ${componentType} | label: "${rawLabel}" | customId: ${customId} | disabled: ${isDisabled}`);
 
-                    // Check if it's a button (type 2)
                     if (componentType !== 2 && componentType !== 'BUTTON') {
                         console.log(`[SKIP_NOT_BTN] type=${componentType}`);
                         continue;
                     }
                     
-                    // Fixed: EXPANDED label detection
                     const claimKeywords = /(claim|accept|take|open|get|create|start|new|ticket)/i;
                     const closeKeywords = /(close|delete|end|cancel|shutdown)/i;
                     
                     console.log(`[LABEL_CHECK] raw: "${rawLabel}" | claimMatch: ${claimKeywords.test(rawLabel)} | closeMatch: ${closeKeywords.test(rawLabel)}`);
                     
-                    // Must match claim keywords, must NOT be close-only button
                     if (!claimKeywords.test(rawLabel)) {
                         console.log(`[SKIP_NO_CLAIM_KEYWORD]`);
                         continue;
@@ -305,7 +294,6 @@ class SelfbotManager {
                     let clicked = false;
                     let lastError = '';
 
-                    // Method 1: Direct button click
                     if (!clicked && typeof btn.click === 'function') {
                         try {
                             console.log(`[TRY_BTN_CLICK]`);
@@ -318,7 +306,6 @@ class SelfbotManager {
                         }
                     }
 
-                    // Method 2: Message clickButton
                     if (!clicked) {
                         try {
                             console.log(`[TRY_MSG_CLICK] ${customId}`);
@@ -331,7 +318,6 @@ class SelfbotManager {
                         }
                     }
                     
-                    // Method 3: REST API with proper structure
                     if (!clicked) {
                         try {
                             console.log(`[TRY_API_CLICK]`);
@@ -367,7 +353,6 @@ class SelfbotManager {
                         }
                     }
 
-                    // Method 4: Raw fetch (nuclear option)
                     if (!clicked) {
                         try {
                             console.log(`[TRY_V4_RAW]`);
@@ -413,7 +398,6 @@ class SelfbotManager {
                         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
                         console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
                         
-                        // Fixed: 2 minute auto-release instead of 5
                         setTimeout(() => {
                             if (this.currentTicket === message.channel.id) {
                                 this.currentTicket = null;
@@ -505,7 +489,12 @@ async function buildPanel(userId) {
 
 bot.on('interactionCreate', async (ix) => {
     if (ix.isCommand()) {
-        try { await ix.deferReply({ flags: MessageFlags.Ephemeral }); } catch { return; }
+        // Fixed: Defer immediately within 1 second
+        try { 
+            await ix.deferReply({ flags: MessageFlags.Ephemeral }); 
+        } catch { 
+            return; 
+        }
 
         if (ix.user.id === OWNER_ID) {
             if (ix.commandName === 'generatekey') {
@@ -608,6 +597,7 @@ bot.on('interactionCreate', async (ix) => {
 
         if (ix.customId.startsWith('start_')) {
             console.log(`[START_BUTTON] ${uid}`);
+            // Fixed: Defer immediately to prevent "application did not respond"
             await ix.deferUpdate();
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
             if (!user?.token || !user?.category_id) {
@@ -625,6 +615,7 @@ bot.on('interactionCreate', async (ix) => {
 
         if (ix.customId.startsWith('stop_')) {
             console.log(`[STOP_BUTTON] ${uid}`);
+            // Fixed: Defer immediately to prevent "application did not respond"
             await ix.deferUpdate();
             const sb = activeSelfbots.get(uid);
             if (sb) { sb.stop(); activeSelfbots.delete(uid); }
@@ -643,6 +634,7 @@ bot.on('interactionCreate', async (ix) => {
 
         if (ix.customId.startsWith('mod_token_')) {
             console.log(`[TOKEN_MODAL] ${uid}`);
+            // Fixed: Defer immediately
             await ix.deferReply({ flags: MessageFlags.Ephemeral });
             
             const check = await validateToken(val);
@@ -657,18 +649,10 @@ bot.on('interactionCreate', async (ix) => {
             
             console.log(`[TOKEN_SET] ${uid} -> ${check.tag}`);
             
-            const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
-            if (user?.category_id) {
-                console.log(`[AUTO_START] ${uid}`);
-                const sb = new SelfbotManager(uid, user);
-                activeSelfbots.set(uid, sb);
-                await sb.start();
-                db.prepare('UPDATE users SET is_running = 1 WHERE user_id = ?').run(uid);
-            }
-            
+            // Fixed: Removed auto-start - user must manually click Start
             const panel = await buildPanel(uid);
             return ix.editReply({
-                content: `✅ Token validated: **${check.tag}**${user?.category_id ? ' | Auto-started!' : ''}`,
+                content: `✅ Token validated: **${check.tag}**\n🔘 Click Start to begin claiming`,
                 embeds: panel.embeds,
                 components: panel.components
             });
@@ -676,18 +660,12 @@ bot.on('interactionCreate', async (ix) => {
 
         if (ix.customId.startsWith('mod_cat_')) {
             console.log(`[CAT_MODAL] ${uid} | value: ${val}`);
-            db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
+            // Fixed: Defer immediately
             await ix.deferUpdate();
             
-            const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
-            if (user?.token && user.token.length > 10) {
-                console.log(`[AUTO_START] ${uid}`);
-                const sb = new SelfbotManager(uid, user);
-                activeSelfbots.set(uid, sb);
-                await sb.start();
-                db.prepare('UPDATE users SET is_running = 1 WHERE user_id = ?').run(uid);
-            }
+            db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
             
+            // Fixed: Removed auto-start - user must manually click Start
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
