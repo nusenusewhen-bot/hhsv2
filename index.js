@@ -42,7 +42,7 @@ class SelfbotManager {
         try {
             this.client = new SelfbotClient({ checkUpdate: false });
 
-            this.client.once('ready', () => {
+            this.client.once('clientReady', () => {
                 console.log(`[READY] ${this.userId}`);
                 this.errorCount = 0;
                 
@@ -56,10 +56,23 @@ class SelfbotManager {
                     setTimeout(() => this.newChannels.delete(packet.id), 60000);
                 });
 
-                this.client.on('raw', (packet) => {
-                    if ((packet.t === 'MESSAGE_CREATE' || packet.t === 'MESSAGE_UPDATE') && packet.d?.components?.length) {
-                        if (!this.newChannels.has(packet.d.channel_id)) return;
-                        this.handleRawMessage(packet.d);
+                this.client.on('messageCreate', (message) => {
+                    if (message.channel.parentId !== this.config.category_id) return;
+                    if (!this.newChannels.has(message.channel.id)) return;
+                    if (this.currentTicket) return;
+                    
+                    if (message.components?.length) {
+                        this.handleMessage(message);
+                    }
+                });
+
+                this.client.on('messageUpdate', (_, message) => {
+                    if (message.channel.parentId !== this.config.category_id) return;
+                    if (!this.newChannels.has(message.channel.id)) return;
+                    if (this.currentTicket) return;
+                    
+                    if (message.components?.length) {
+                        this.handleMessage(message);
                     }
                 });
 
@@ -91,84 +104,52 @@ class SelfbotManager {
         
         try {
             const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 1 });
+            const messages = await channel.messages.fetch({ limit: 5 });
             
             for (const [, msg] of messages) {
                 if (!msg.components?.length) continue;
-                
-                for (const row of msg.components) {
-                    for (const btn of row.components) {
-                        if (!btn.custom_id && btn.label?.toLowerCase().includes('claim')) {
-                            const fresh = await channel.messages.fetch(msg.id, { force: true });
-                            for (const r of fresh.components || []) {
-                                for (const b of r.components) {
-                                    if (b.custom_id && b.label?.toLowerCase().includes('claim')) {
-                                        await this.clickClaim(fresh, b.custom_id);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                await this.handleMessage(msg);
+                if (this.currentTicket) return;
             }
         } catch (e) {
             console.error(`[SCAN_ERR] ${this.userId}: ${e.message}`);
         }
     }
 
-    handleRawMessage(data) {
-        if (this.currentTicket || this.claimedChannels.has(data.channel_id)) return;
+    handleMessage(message) {
+        if (this.currentTicket || this.claimedChannels.has(message.channel.id)) return;
         
-        for (const row of data.components) {
+        for (const row of message.components) {
             for (const btn of row.components) {
                 const label = (btn.label || '').toLowerCase();
                 
                 if (!label.includes('claim') || label.includes('close') || btn.disabled || !btn.custom_id) continue;
 
-                console.log(`[CLAIM] ${this.userId} | ${data.channel_id} | ${btn.label}`);
-                this.clickClaim({
-                    channelId: data.channel_id,
-                    guildId: data.guild_id,
-                    id: data.id,
-                    applicationId: data.application_id || data.author?.id
-                }, btn.custom_id);
-                this.newChannels.delete(data.channel_id);
+                console.log(`[CLAIM] ${this.userId} | ${message.channel.id} | ${btn.label}`);
+                this.clickClaim(message, btn.custom_id);
+                this.newChannels.delete(message.channel.id);
                 return;
             }
         }
     }
 
-    async clickClaim(msgData, customId) {
+    async clickClaim(message, customId) {
         if (this.currentTicket) return;
         
         try {
-            const channel = await this.client.channels.fetch(msgData.channelId);
-            const msg = await channel.messages.fetch(msgData.id);
-            await msg.clickButton(customId);
+            await message.clickButton(customId);
         } catch (e) {
-            this.client.ws.broadcast({
-                op: 1,
-                d: {
-                    type: 3,
-                    nonce: Date.now().toString(),
-                    guild_id: String(msgData.guildId),
-                    channel_id: String(msgData.channelId),
-                    message_id: String(msgData.id),
-                    application_id: String(msgData.applicationId),
-                    session_id: String(this.client.sessionId),
-                    data: { component_type: 2, custom_id: String(customId) }
-                }
-            });
+            console.error(`[CLICK_ERR] ${this.userId}: ${e.message}`);
+            return;
         }
         
-        this.currentTicket = msgData.channelId;
-        this.claimedChannels.add(msgData.channelId);
-        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(msgData.channelId, this.userId);
-        console.log(`[CLAIMED] ${this.userId} -> ${msgData.channelId}`);
+        this.currentTicket = message.channel.id;
+        this.claimedChannels.add(message.channel.id);
+        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
+        console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
         
         setTimeout(() => {
-            if (this.currentTicket === msgData.channelId) {
+            if (this.currentTicket === message.channel.id) {
                 this.currentTicket = null;
                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
             }
