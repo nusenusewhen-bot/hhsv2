@@ -49,7 +49,6 @@ class SelfbotManager {
             console.log(`[CREATING_CLIENT] ${this.userId}`);
             this.client = new SelfbotClient({ checkUpdate: false });
 
-            // Handle both old and new event names
             const readyHandler = () => {
                 if (this.readyFired) return;
                 this.readyFired = true;
@@ -61,7 +60,6 @@ class SelfbotManager {
             this.client.once('ready', readyHandler);
             this.client.once('clientReady', readyHandler);
 
-            // Timeout if ready never fires
             setTimeout(() => {
                 if (!this.readyFired) {
                     console.log(`[READY_TIMEOUT] ${this.userId} - forcing start anyway`);
@@ -69,7 +67,6 @@ class SelfbotManager {
                 }
             }, 10000);
 
-            // Event listeners
             this.client.on('messageCreate', async (message) => {
                 console.log(`[EVENT_MSG_CREATE] ${message.channel.id} | parent: ${message.channel.parentId} | target: ${this.config.category_id}`);
                 if (message.channel.parentId !== this.config.category_id) return;
@@ -123,10 +120,8 @@ class SelfbotManager {
     startPolling() {
         console.log(`[POLLING_STARTED] ${this.userId} | category: ${this.config.category_id}`);
         
-        // Immediate first poll
         this.doPoll();
         
-        // Then every 100ms (aggressive)
         this.pollInterval = setInterval(() => this.doPoll(), 100);
     }
 
@@ -139,7 +134,6 @@ class SelfbotManager {
             for (const [, guild] of this.client.guilds.cache) {
                 console.log(`[CHECK_GUILD] ${guild.name} | ${guild.id}`);
                 
-                // Get all channels in the category
                 const categoryChannels = guild.channels.cache.filter(
                     ch => {
                         const match = ch.parentId === this.config.category_id && ch.type === 0;
@@ -193,7 +187,6 @@ class SelfbotManager {
                 if (lastChecked && Date.now() - lastChecked < 3000) continue;
                 this.lastCheckedMessages.set(msg.id, Date.now());
                 
-                // Cleanup old entries
                 if (this.lastCheckedMessages.size > 1000) {
                     const now = Date.now();
                     for (const [id, ts] of this.lastCheckedMessages) {
@@ -238,19 +231,19 @@ class SelfbotManager {
                 
                 for (let btnIdx = 0; btnIdx < row.components.length; btnIdx++) {
                     const btn = row.components[btnIdx];
-                    console.log(`[CHECK_BTN] ${btnIdx} | type: ${btn.type} | label: "${btn.label}" | customId: ${btn.custom_id} | disabled: ${btn.disabled}`);
+                    console.log(`[CHECK_BTN] ${btnIdx} | type: ${btn.type} | raw label: "${btn.label}" | customId: ${btn.custom_id} | disabled: ${btn.disabled}`);
                     
                     if (btn.type !== 2) {
                         console.log(`[SKIP_NOT_BTN] type=${btn.type}`);
                         continue;
                     }
                     
-                    // CASE INSENSITIVE
-                    const label = (btn.label || '').toLowerCase();
-                    console.log(`[LABEL_CHECK] "${label}" includes 'claim'? ${label.includes('claim')}`);
+                    const rawLabel = (btn.label || '').toLowerCase();
+                    const label = rawLabel.replace(/[^a-z0-9]/g, '');
+                    console.log(`[LABEL_CLEANED] "${rawLabel}" -> "${label}" | includes 'claim'? ${label.includes('claim')}`);
                     
                     if (!label.includes('claim')) {
-                        console.log(`[SKIP_NO_CLAIM]`);
+                        console.log(`[SKIP_NO_CLAIM] cleaned label: "${label}"`);
                         continue;
                     }
                     if (label.includes('close')) {
@@ -567,7 +560,6 @@ bot.on('interactionCreate', async (ix) => {
             
             console.log(`[TOKEN_SET] ${uid} -> ${check.tag}`);
             
-            // AUTO-START if category is also set
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
             if (user?.category_id) {
                 console.log(`[AUTO_START] ${uid}`);
@@ -590,7 +582,6 @@ bot.on('interactionCreate', async (ix) => {
             db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
             await ix.deferUpdate();
             
-            // AUTO-START if token is also set
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
             if (user?.token && user.token.length > 10) {
                 console.log(`[AUTO_START] ${uid}`);
