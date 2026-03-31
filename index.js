@@ -39,9 +39,14 @@ class SelfbotManager {
     }
 
     async start() {
-        if (this.client) return;
+        console.log(`[START_CALLED] ${this.userId}`);
+        if (this.client) {
+            console.log(`[ALREADY_STARTED] ${this.userId}`);
+            return;
+        }
         
         try {
+            console.log(`[CREATING_CLIENT] ${this.userId}`);
             this.client = new SelfbotClient({ checkUpdate: false });
 
             // Handle both old and new event names
@@ -66,14 +71,17 @@ class SelfbotManager {
 
             // Event listeners
             this.client.on('messageCreate', async (message) => {
+                console.log(`[EVENT_MSG_CREATE] ${message.channel.id} | parent: ${message.channel.parentId} | target: ${this.config.category_id}`);
                 if (message.channel.parentId !== this.config.category_id) return;
                 if (this.currentTicket) return;
                 if (message.components?.length > 0) {
+                    console.log(`[MSG_HAS_COMPONENTS] ${message.channel.id} | ${message.components.length} rows`);
                     await this.tryClickClaim(message);
                 }
             });
 
             this.client.on('messageUpdate', async (_, message) => {
+                console.log(`[EVENT_MSG_UPDATE] ${message.channel.id}`);
                 if (message.channel.parentId !== this.config.category_id) return;
                 if (this.currentTicket) return;
                 if (message.components?.length > 0) {
@@ -82,11 +90,13 @@ class SelfbotManager {
             });
 
             this.client.ws.on('CHANNEL_CREATE', async (packet) => {
+                console.log(`[EVENT_CH_CREATE] ${packet.id} | parent: ${packet.parent_id} | target: ${this.config.category_id}`);
                 if (packet.parent_id !== this.config.category_id) return;
                 setTimeout(() => this.pollChannel(packet.id), 1000);
             });
 
             this.client.on('channelDelete', (ch) => {
+                console.log(`[EVENT_CH_DELETE] ${ch.id}`);
                 this.claimedChannels.delete(ch.id);
                 this.processingChannels.delete(ch.id);
                 if (this.currentTicket === ch.id) {
@@ -101,7 +111,9 @@ class SelfbotManager {
                 if (this.errorCount > 5) this.stop();
             });
 
+            console.log(`[LOGGING_IN] ${this.userId}`);
             await this.client.login(this.config.token);
+            console.log(`[LOGIN_DONE] ${this.userId}`);
         } catch (e) {
             console.error(`[START_FAIL] ${this.userId}: ${e.message}`);
             db.prepare('UPDATE users SET is_running = 0, last_error = ? WHERE user_id = ?').run(e.message, this.userId);
@@ -109,33 +121,52 @@ class SelfbotManager {
     }
 
     startPolling() {
-        console.log(`[POLLING_STARTED] ${this.userId}`);
+        console.log(`[POLLING_STARTED] ${this.userId} | category: ${this.config.category_id}`);
         
         // Immediate first poll
         this.doPoll();
         
-        // Then every 500ms
-        this.pollInterval = setInterval(() => this.doPoll(), 500);
+        // Then every 100ms (aggressive)
+        this.pollInterval = setInterval(() => this.doPoll(), 100);
     }
 
     async doPoll() {
         if (this.currentTicket) return;
         
         try {
+            console.log(`[POLL_TICK] ${this.userId} | guilds: ${this.client.guilds.cache.size}`);
+            
             for (const [, guild] of this.client.guilds.cache) {
+                console.log(`[CHECK_GUILD] ${guild.name} | ${guild.id}`);
+                
+                // Get all channels in the category
                 const categoryChannels = guild.channels.cache.filter(
-                    ch => ch.parentId === this.config.category_id && ch.type === 0
+                    ch => {
+                        const match = ch.parentId === this.config.category_id && ch.type === 0;
+                        if (match) console.log(`[FOUND_CH] ${ch.name} | ${ch.id} | parent: ${ch.parentId}`);
+                        return match;
+                    }
                 );
+                
+                console.log(`[CATEGORY_CHS] ${categoryChannels.size} channels in category ${this.config.category_id}`);
                 
                 for (const [, channel] of categoryChannels) {
                     if (this.currentTicket) break;
-                    if (this.claimedChannels.has(channel.id)) continue;
-                    if (this.processingChannels.has(channel.id)) continue;
+                    if (this.claimedChannels.has(channel.id)) {
+                        console.log(`[SKIP_CLAIMED] ${channel.id}`);
+                        continue;
+                    }
+                    if (this.processingChannels.has(channel.id)) {
+                        console.log(`[SKIP_PROCESSING] ${channel.id}`);
+                        continue;
+                    }
                     
                     await this.pollChannel(channel.id);
                 }
             }
-        } catch (e) {}
+        } catch (e) {
+            console.error(`[POLL_ERR] ${this.userId}: ${e.message}`);
+        }
     }
 
     async pollChannel(channelId) {
@@ -143,17 +174,26 @@ class SelfbotManager {
         if (this.claimedChannels.has(channelId)) return;
         if (this.processingChannels.has(channelId)) return;
         
+        console.log(`[POLL_CH] ${channelId}`);
+        this.processingChannels.add(channelId);
+        
         try {
             const channel = await this.client.channels.fetch(channelId);
-            if (!channel) return;
+            if (!channel) {
+                console.log(`[CH_NOT_FOUND] ${channelId}`);
+                return;
+            }
             
-            const messages = await channel.messages.fetch({ limit: 5 });
+            console.log(`[FETCH_MSGS] ${channelId}`);
+            const messages = await channel.messages.fetch({ limit: 10 });
+            console.log(`[FETCHED] ${channelId} | ${messages.size} messages`);
             
             for (const [, msg] of messages) {
                 const lastChecked = this.lastCheckedMessages.get(msg.id);
-                if (lastChecked && Date.now() - lastChecked < 5000) continue;
+                if (lastChecked && Date.now() - lastChecked < 3000) continue;
                 this.lastCheckedMessages.set(msg.id, Date.now());
                 
+                // Cleanup old entries
                 if (this.lastCheckedMessages.size > 1000) {
                     const now = Date.now();
                     for (const [id, ts] of this.lastCheckedMessages) {
@@ -161,54 +201,103 @@ class SelfbotManager {
                     }
                 }
                 
+                console.log(`[CHECK_MSG] ${msg.id} | components: ${msg.components?.length || 0}`);
+                
                 if (msg.components?.length > 0) {
+                    console.log(`[HAS_COMPONENTS] ${msg.id} | ${msg.components.length} rows`);
                     const claimed = await this.tryClickClaim(msg);
-                    if (claimed) return;
+                    if (claimed) {
+                        console.log(`[CLAIMED_IN_POLL] ${channelId}`);
+                        return;
+                    }
                 }
             }
-        } catch (e) {}
+        } catch (e) {
+            console.error(`[POLL_CH_ERR] ${channelId}: ${e.message}`);
+        } finally {
+            setTimeout(() => this.processingChannels.delete(channelId), 1000);
+        }
     }
 
     async tryClickClaim(message) {
-        if (this.currentTicket) return false;
-        if (this.claimedChannels.has(message.channel.id)) return false;
-        if (this.processingChannels.has(message.channel.id)) return false;
+        console.log(`[TRY_CLICK] ${message.channel.id} | ${message.id}`);
         
-        this.processingChannels.add(message.channel.id);
+        if (this.currentTicket) {
+            console.log(`[SKIP_HAS_TICKET] ${message.channel.id}`);
+            return false;
+        }
+        if (this.claimedChannels.has(message.channel.id)) {
+            console.log(`[SKIP_CH_CLAIMED] ${message.channel.id}`);
+            return false;
+        }
         
         try {
-            for (const row of message.components) {
-                for (const btn of row.components) {
-                    if (btn.type !== 2) continue;
+            for (let rowIdx = 0; rowIdx < message.components.length; rowIdx++) {
+                const row = message.components[rowIdx];
+                console.log(`[CHECK_ROW] ${rowIdx} | ${row.components.length} buttons`);
+                
+                for (let btnIdx = 0; btnIdx < row.components.length; btnIdx++) {
+                    const btn = row.components[btnIdx];
+                    console.log(`[CHECK_BTN] ${btnIdx} | type: ${btn.type} | label: "${btn.label}" | customId: ${btn.custom_id} | disabled: ${btn.disabled}`);
+                    
+                    if (btn.type !== 2) {
+                        console.log(`[SKIP_NOT_BTN] type=${btn.type}`);
+                        continue;
+                    }
                     
                     // CASE INSENSITIVE
                     const label = (btn.label || '').toLowerCase();
+                    console.log(`[LABEL_CHECK] "${label}" includes 'claim'? ${label.includes('claim')}`);
                     
-                    if (!label.includes('claim')) continue;
-                    if (label.includes('close')) continue;
-                    if (btn.disabled) continue;
-                    if (!btn.custom_id) continue;
+                    if (!label.includes('claim')) {
+                        console.log(`[SKIP_NO_CLAIM]`);
+                        continue;
+                    }
+                    if (label.includes('close')) {
+                        console.log(`[SKIP_CLOSE]`);
+                        continue;
+                    }
+                    if (btn.disabled) {
+                        console.log(`[SKIP_DISABLED]`);
+                        continue;
+                    }
+                    if (!btn.custom_id) {
+                        console.log(`[SKIP_NO_CUSTOM_ID]`);
+                        continue;
+                    }
 
-                    console.log(`[CLICKING] ${this.userId} | ${btn.custom_id} | "${btn.label}"`);
+                    console.log(`[ATTEMPT_CLICK] ${btn.custom_id} | "${btn.label}"`);
                     
                     let clicked = false;
+                    let clickError = '';
                     
                     try {
                         if (btn.click) {
+                            console.log(`[TRY_BTN_CLICK]`);
                             await btn.click();
                             clicked = true;
+                            console.log(`[CLICKED_V1]`);
                         }
-                    } catch (e1) {}
-                    
-                    if (!clicked) {
-                        try {
-                            await message.clickButton(btn.custom_id);
-                            clicked = true;
-                        } catch (e2) {}
+                    } catch (e1) {
+                        clickError = e1.message;
+                        console.log(`[V1_FAIL] ${e1.message}`);
                     }
                     
                     if (!clicked) {
                         try {
+                            console.log(`[TRY_MSG_CLICK] ${btn.custom_id}`);
+                            await message.clickButton(btn.custom_id);
+                            clicked = true;
+                            console.log(`[CLICKED_V2]`);
+                        } catch (e2) {
+                            clickError = e2.message;
+                            console.log(`[V2_FAIL] ${e2.message}`);
+                        }
+                    }
+                    
+                    if (!clicked) {
+                        try {
+                            console.log(`[TRY_API_CLICK]`);
                             await this.client.api.interactions.post({
                                 data: {
                                     type: 3,
@@ -225,7 +314,11 @@ class SelfbotManager {
                                 }
                             });
                             clicked = true;
-                        } catch (e3) {}
+                            console.log(`[CLICKED_V3]`);
+                        } catch (e3) {
+                            clickError = e3.message;
+                            console.log(`[V3_FAIL] ${e3.message}`);
+                        }
                     }
                     
                     if (clicked) {
@@ -238,21 +331,26 @@ class SelfbotManager {
                             if (this.currentTicket === message.channel.id) {
                                 this.currentTicket = null;
                                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+                                console.log(`[RELEASED] ${this.userId} -> ${message.channel.id}`);
                             }
                         }, 300000);
                         
                         return true;
+                    } else {
+                        console.log(`[ALL_CLICKS_FAILED] last error: ${clickError}`);
                     }
                 }
             }
-        } finally {
-            setTimeout(() => this.processingChannels.delete(message.channel.id), 2000);
+        } catch (e) {
+            console.error(`[TRY_CLICK_ERR] ${e.message}`);
         }
         
+        console.log(`[NO_CLAIM_BTN_FOUND] ${message.id}`);
         return false;
     }
 
     stop() {
+        console.log(`[STOPPING] ${this.userId}`);
         if (this.pollInterval) {
             clearInterval(this.pollInterval);
             this.pollInterval = null;
@@ -267,17 +365,21 @@ class SelfbotManager {
         this.lastCheckedMessages.clear();
         this.readyFired = false;
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
+        console.log(`[STOPPED] ${this.userId}`);
     }
 }
 
 async function validateToken(token) {
+    console.log(`[VALIDATING_TOKEN]`);
     const test = new SelfbotClient({ checkUpdate: false });
     try {
         await test.login(token);
         const tag = test.user?.tag || 'unknown';
         await test.destroy();
+        console.log(`[TOKEN_VALID] ${tag}`);
         return { valid: true, tag };
     } catch (e) {
+        console.log(`[TOKEN_INVALID] ${e.message}`);
         return { valid: false, error: e.message };
     }
 }
@@ -415,6 +517,7 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.customId.startsWith('start_')) {
+            console.log(`[START_BUTTON] ${uid}`);
             await ix.deferUpdate();
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
             if (!user?.token || !user?.category_id) {
@@ -431,6 +534,7 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.customId.startsWith('stop_')) {
+            console.log(`[STOP_BUTTON] ${uid}`);
             await ix.deferUpdate();
             const sb = activeSelfbots.get(uid);
             if (sb) { sb.stop(); activeSelfbots.delete(uid); }
@@ -448,6 +552,7 @@ bot.on('interactionCreate', async (ix) => {
         const val = ix.fields.getTextInputValue('val');
 
         if (ix.customId.startsWith('mod_token_')) {
+            console.log(`[TOKEN_MODAL] ${uid}`);
             await ix.deferReply({ flags: MessageFlags.Ephemeral });
             
             const check = await validateToken(val);
@@ -481,6 +586,7 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.customId.startsWith('mod_cat_')) {
+            console.log(`[CAT_MODAL] ${uid} | value: ${val}`);
             db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
             await ix.deferUpdate();
             
@@ -520,6 +626,7 @@ bot.once('ready', async () => {
             db.prepare('UPDATE users SET is_running = 0 WHERE user_id = ?').run(u.user_id);
             continue;
         }
+        console.log(`[RESTARTING] ${u.user_id}`);
         const sb = new SelfbotManager(u.user_id, u);
         activeSelfbots.set(u.user_id, sb);
         sb.start().catch(e => console.log(`[RESTART_FAIL] ${u.user_id}: ${e.message}`));
