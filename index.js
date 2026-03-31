@@ -2,15 +2,40 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
-const { Client: BotClient, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const fetch = require('node-fetch');
+const {
+    Client: BotClient,
+    GatewayIntentBits,
+    EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle
+} = require('discord.js');
 
 puppeteer.use(StealthPlugin());
 
 const db = new Database('./keys.db');
 db.pragma('journal_mode = WAL');
 db.exec(`
-    CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, duration_days INTEGER, created_at INTEGER, redeemed_by TEXT, redeemed_at INTEGER, expires_at INTEGER, active INTEGER DEFAULT 1);
-    CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, token TEXT, category_id TEXT, guild_id TEXT, is_running INTEGER DEFAULT 0, current_ticket TEXT, last_error TEXT, browser_pid INTEGER);
+    CREATE TABLE IF NOT EXISTS keys (
+        key TEXT PRIMARY KEY,
+        duration_days INTEGER,
+        created_at INTEGER,
+        redeemed_by TEXT,
+        redeemed_at INTEGER,
+        expires_at INTEGER,
+        active INTEGER DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        token TEXT,
+        category_id TEXT,
+        guild_id TEXT,
+        is_running INTEGER DEFAULT 0,
+        current_ticket TEXT,
+        last_error TEXT,
+        browser_pid INTEGER
+    );
 `);
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -40,7 +65,7 @@ class PuppeteerClaimer {
 
     async start() {
         console.log(`[PUPPETEER_START] ${this.userId}`);
-        
+
         try {
             this.browser = await puppeteer.launch({
                 headless: true,
@@ -58,37 +83,35 @@ class PuppeteerClaimer {
             db.prepare('UPDATE users SET browser_pid = ? WHERE user_id = ?').run(pid, this.userId);
 
             this.page = await this.browser.newPage();
-            
-            await this.page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-            
-            // Fixed: Wait for page to be fully loaded before injecting token
+
+            await this.page.setUserAgent(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            );
+
             await this.page.goto('https://discord.com/login', { waitUntil: 'domcontentloaded' });
-            
-            // Fixed: Wait for document.body to exist, then inject token
             await this.page.waitForFunction(() => document.readyState === 'complete');
-            
-            // Fixed: Use evaluateOnNewDocument to ensure localStorage is available
+
             await this.page.evaluateOnNewDocument((token) => {
                 localStorage.setItem('token', `"${token}"`);
             }, this.token);
-            
-            // Reload to apply token
+
             await this.page.reload({ waitUntil: 'networkidle2' });
-            
-            // Fixed: Wait for Discord's actual UI with multiple possible selectors
-            await this.page.waitForSelector('nav[aria-label="Servers sidebar"], [class*="guilds"], [class*="sidebar"]', { timeout: 30000 });
-            
+
+            await this.page.waitForSelector(
+                'nav[aria-label="Servers sidebar"], [class*="guilds"], [class*="sidebar"]',
+                { timeout: 30000 }
+            );
+
             console.log(`[PUPPETEER_READY] ${this.userId} - Logged in`);
             this.isRunning = true;
-            
+
             if (this.guildId) {
                 await this.navigateToGuild();
             }
-            
+
             this.startMonitoring();
-            
             db.prepare('UPDATE users SET is_running = 1, last_error = NULL WHERE user_id = ?').run(this.userId);
-            
+
         } catch (e) {
             console.error(`[PUPPETEER_FAIL] ${this.userId}: ${e.message}`);
             db.prepare('UPDATE users SET is_running = 0, last_error = ? WHERE user_id = ?').run(e.message, this.userId);
@@ -110,10 +133,10 @@ class PuppeteerClaimer {
 
     startMonitoring() {
         console.log(`[MONITOR_START] ${this.userId} | Category: ${this.categoryId}`);
-        
+
         this.monitorInterval = setInterval(async () => {
             if (!this.isRunning || this.currentTicket) return;
-            
+
             try {
                 await this.checkForTickets();
             } catch (e) {
@@ -121,8 +144,9 @@ class PuppeteerClaimer {
             }
         }, 800);
     }
+        async checkForTickets() {
+        if (!this.page) return;
 
-    async checkForTickets() {
         const tickets = await this.page.$$eval(
             `[data-list-item-id*="channels___"]:has([class*="channelName"])`,
             (channels) => {
@@ -130,13 +154,9 @@ class PuppeteerClaimer {
                     const channelId = ch.getAttribute('data-list-item-id')?.replace('channels___', '');
                     const channelName = ch.querySelector('[class*="channelName"]')?.innerText || '';
                     const hasButton = ch.querySelector('button, [role="button"]') !== null;
-                    
-                    return {
-                        channelId,
-                        channelName,
-                        hasButton
-                    };
-                }).filter(t => t.hasButton && !t.channelName.includes('closed') && !t.channelName.includes('archived'));
+
+                    return { channelId, channelName, hasButton };
+                }).filter(t => t.hasButton && !t.channelName.toLowerCase().includes('closed') && !t.channelName.toLowerCase().includes('archived'));
             }
         );
 
@@ -145,31 +165,32 @@ class PuppeteerClaimer {
             if (this.currentTicket) return;
 
             console.log(`[FOUND_TICKET] ${ticket.channelName} (${ticket.channelId})`);
-            
+
             await this.page.click(`[data-list-item-id="channels___${ticket.channelId}"]`);
             await this.page.waitForTimeout(500);
-            
+
             const claimed = await this.findAndClickClaimButton();
-            
+
             if (claimed) {
                 this.currentTicket = ticket.channelId;
                 this.claimedChannels.add(ticket.channelId);
                 db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(ticket.channelId, this.userId);
-                
+
                 console.log(`[CLAIMED] ${this.userId} -> ${ticket.channelName}`);
-                
+
                 setTimeout(() => {
                     this.currentTicket = null;
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
                     console.log(`[RELEASED] ${this.userId}`);
                 }, 120000);
-                
+
                 return;
             }
         }
     }
 
     async findAndClickClaimButton() {
+        // Try direct Claim text buttons
         const claimButton = await this.page.$eval(
             'button:has-text("Claim"):not([disabled]), button:has-text("CLAIM"):not([disabled]), button:has-text("claim"):not([disabled])',
             btn => ({ text: btn.innerText, found: true })
@@ -182,6 +203,7 @@ class PuppeteerClaimer {
             return true;
         }
 
+        // Fallback: any button with claim-like text
         const buttons = await this.page.$$eval(
             '[class*="message"] button:not([disabled]), [class*="embed"] button:not([disabled])',
             btns => btns.map(b => ({
@@ -193,26 +215,20 @@ class PuppeteerClaimer {
         for (let i = 0; i < buttons.length; i++) {
             const btn = buttons[i];
             const text = btn.text + btn.emoji;
-            
             if (/(claim|accept|take|open|get)/i.test(text) && !/(close|delete|end)/i.test(text)) {
                 console.log(`[FOUND_BTN] Index ${i}: ${text}`);
-                
+
                 const clickSuccess = await this.page.evaluate((index) => {
                     const btns = document.querySelectorAll('[class*="message"] button:not([disabled]), [class*="embed"] button:not([disabled])');
-                    if (btns[index]) {
-                        btns[index].click();
-                        return true;
-                    }
+                    if (btns[index]) { btns[index].click(); return true; }
                     return false;
                 }, i);
 
-                if (clickSuccess) {
-                    await this.page.waitForTimeout(300);
-                    return true;
-                }
+                if (clickSuccess) { await this.page.waitForTimeout(300); return true; }
             }
         }
 
+        // Fallback: emoji buttons 🎫 ✅ 📩
         const emojiButtons = await this.page.$$eval(
             'button:has(img[alt="🎫"]):not([disabled]), button:has(img[alt="✅"]):not([disabled]), button:has(img[alt="📩"]):not([disabled])',
             btns => btns.length
@@ -220,7 +236,7 @@ class PuppeteerClaimer {
 
         if (emojiButtons > 0) {
             console.log(`[FOUND_EMOJI_BTN] ${emojiButtons} buttons`);
-            await this.page.click('button:has(img[alt="🎫"]):not([disabled])').catch(() => 
+            await this.page.click('button:has(img[alt="🎫"]):not([disabled])').catch(() =>
                 this.page.click('button:has(img[alt="✅"]):not([disabled])').catch(() => {})
             );
             await this.page.waitForTimeout(300);
@@ -232,38 +248,33 @@ class PuppeteerClaimer {
 
     stop() {
         console.log(`[PUPPETEER_STOP] ${this.userId}`);
-        
+
         this.isRunning = false;
-        
+
         if (this.monitorInterval) {
             clearInterval(this.monitorInterval);
             this.monitorInterval = null;
         }
-        
+
         if (this.browser) {
-            try {
-                this.browser.close();
-            } catch (e) {
+            try { this.browser.close(); } 
+            catch (e) {
                 const pid = db.prepare('SELECT browser_pid FROM users WHERE user_id = ?').get(this.userId)?.browser_pid;
-                if (pid) {
-                    try { process.kill(pid, 'SIGKILL'); } catch {}
-                }
+                if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
             }
             this.browser = null;
         }
-        
+
         this.currentTicket = null;
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL, browser_pid = NULL WHERE user_id = ?').run(this.userId);
-        
+
         console.log(`[STOPPED] ${this.userId}`);
     }
 }
 
 async function validateToken(token) {
     try {
-        const response = await fetch('https://discord.com/api/v9/users/@me', {
-            headers: { 'Authorization': token }
-        });
+        const response = await fetch('https://discord.com/api/v9/users/@me', { headers: { 'Authorization': token } });
         if (!response.ok) throw new Error('Invalid token');
         const user = await response.json();
         return { valid: true, tag: `${user.username}#${user.discriminator}` };
@@ -271,16 +282,15 @@ async function validateToken(token) {
         return { valid: false, error: e.message };
     }
 }
-
 async function buildPanel(userId) {
     const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
     if (!user) return null;
-    
+
     const claimer = activeClaimers.get(userId);
     const running = claimer?.isRunning || false;
     const hasToken = !!(user.token && user.token.length > 10);
     const hasCategory = !!user.category_id;
-    
+
     const embed = new EmbedBuilder()
         .setTitle('🎫 Ticket Claimer (Puppeteer)')
         .addFields(
@@ -317,12 +327,12 @@ bot.on('interactionCreate', async (ix) => {
                 db.prepare('INSERT INTO keys (key, duration_days, created_at, expires_at) VALUES (?, ?, ?, ?)').run(key, days, Date.now(), exp);
                 return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key Generated').setDescription('`' + key + '`').setColor(0x00FF00)] });
             }
-            
+
             if (ix.commandName === 'revokekey') {
                 db.prepare('UPDATE keys SET active = 0 WHERE key = ?').run(ix.options.getString('key'));
                 return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 Key Revoked').setColor(0xFF0000)] });
             }
-            
+
             if (ix.commandName === 'revokeuser') {
                 const uid = ix.options.getString('userid');
                 const claimer = activeClaimers.get(uid);
@@ -336,7 +346,7 @@ bot.on('interactionCreate', async (ix) => {
                 const total = db.prepare('SELECT COUNT(*) as c FROM keys').get().c;
                 const redeemed = db.prepare('SELECT COUNT(*) as c FROM keys WHERE redeemed_by IS NOT NULL').get().c;
                 const active = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_running = 1').get().c;
-                
+
                 const embed = new EmbedBuilder().setTitle('📊 Sales Dashboard').setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`).setColor(0x5865F2);
                 return ix.editReply({ embeds: [embed] });
             }
@@ -347,30 +357,24 @@ bot.on('interactionCreate', async (ix) => {
                 db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
                 return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Owner Lifetime Access').setColor(0x00FF00)] });
             }
-            
+
             const k = db.prepare('SELECT * FROM keys WHERE key = ? AND active = 1').get(ix.options.getString('key'));
             if (!k) return ix.editReply('❌ Invalid key');
             if (k.redeemed_by) return ix.editReply('❌ Key already used');
-            
+
             const exp = k.duration_days === -1 ? null : Date.now() + (k.duration_days * 86400000);
             db.prepare('UPDATE keys SET redeemed_by = ?, redeemed_at = ?, expires_at = ? WHERE key = ?').run(ix.user.id, Date.now(), exp, ix.options.getString('key'));
             db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
             return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Key Redeemed').setColor(0x00FF00)] });
         }
-        
+
         if (ix.commandName === 'manage') {
-            if (ix.user.id === OWNER_ID) {
-                db.prepare('INSERT OR IGNORE INTO users (user_id) VALUES (?)').run(ix.user.id);
-                const panel = await buildPanel(ix.user.id);
-                return ix.editReply(panel);
-            }
-            
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(ix.user.id);
             if (!user) return ix.editReply('❌ No key found. Use `/redeemkey` first.');
-            
+
             const key = db.prepare('SELECT * FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(ix.user.id, Date.now());
             if (!key) return ix.editReply('❌ Key expired');
-            
+
             const panel = await buildPanel(ix.user.id);
             return ix.editReply(panel);
         }
@@ -405,35 +409,26 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.customId.startsWith('start_')) {
-            console.log(`[START_BUTTON] ${uid}`);
             await ix.deferUpdate();
-            
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
-            if (!user?.token || !user?.category_id) {
-                return ix.editReply({ content: '❌ Missing token or category', embeds: [], components: [] });
-            }
-            
+            if (!user?.token || !user?.category_id) return ix.editReply({ content: '❌ Missing token or category', embeds: [], components: [] });
+
             const existing = activeClaimers.get(uid);
             if (existing) existing.stop();
-            
+
             const claimer = new PuppeteerClaimer(uid, user);
             activeClaimers.set(uid, claimer);
             await claimer.start();
-            
+
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
 
         if (ix.customId.startsWith('stop_')) {
-            console.log(`[STOP_BUTTON] ${uid}`);
             await ix.deferUpdate();
-            
             const claimer = activeClaimers.get(uid);
-            if (claimer) { 
-                claimer.stop(); 
-                activeClaimers.delete(uid); 
-            }
-            
+            if (claimer) { claimer.stop(); activeClaimers.delete(uid); }
+
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
@@ -446,21 +441,12 @@ bot.on('interactionCreate', async (ix) => {
         const val = ix.fields.getTextInputValue('val');
 
         if (ix.customId.startsWith('mod_token_')) {
-            console.log(`[TOKEN_MODAL] ${uid}`);
             await ix.deferReply({ ephemeral: true });
-            
             const check = await validateToken(val);
             if (!check.valid) return ix.editReply(`❌ Invalid token: ${check.error}`);
-            
-            const exists = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
-            if (!exists) {
-                db.prepare('INSERT INTO users (user_id, token) VALUES (?, ?)').run(uid, val);
-            } else {
-                db.prepare('UPDATE users SET token = ? WHERE user_id = ?').run(val, uid);
-            }
-            
-            console.log(`[TOKEN_SET] ${uid} -> ${check.tag}`);
-            
+
+            db.prepare('INSERT OR REPLACE INTO users (user_id, token) VALUES (?, ?)').run(uid, val);
+
             const panel = await buildPanel(uid);
             return ix.editReply({
                 content: `✅ Token validated: **${check.tag}**\n🔘 Set Category and click Start`,
@@ -470,23 +456,15 @@ bot.on('interactionCreate', async (ix) => {
         }
 
         if (ix.customId.startsWith('mod_cat_')) {
-            console.log(`[CAT_MODAL] ${uid} | value: ${val}`);
             await ix.deferUpdate();
-            
             db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
-            
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
 
         if (ix.customId.startsWith('mod_guild_')) {
-            console.log(`[GUILD_MODAL] ${uid} | value: ${val}`);
             await ix.deferUpdate();
-            
-            if (val) {
-                db.prepare('UPDATE users SET guild_id = ? WHERE user_id = ?').run(val, uid);
-            }
-            
+            if (val) db.prepare('UPDATE users SET guild_id = ? WHERE user_id = ?').run(val, uid);
             const panel = await buildPanel(uid);
             return ix.editReply(panel);
         }
@@ -495,7 +473,7 @@ bot.on('interactionCreate', async (ix) => {
 
 bot.once('ready', async () => {
     console.log('[BOT] ' + bot.user.tag);
-    
+
     await bot.application.commands.set([
         { name: 'generatekey', description: 'Generate key (Owner only)', options: [{ name: 'duration', type: 3, description: '1, 7, 30, lifetime', required: false }] },
         { name: 'revokekey', description: 'Revoke key (Owner only)', options: [{ name: 'key', type: 3, description: 'Key to revoke', required: true }] },
@@ -509,15 +487,13 @@ bot.once('ready', async () => {
     for (const u of running) {
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL, browser_pid = NULL WHERE user_id = ?').run(u.user_id);
     }
-    
+
     console.log(`[READY] Cleaned up ${running.length} stale entries`);
 });
 
 process.on('SIGINT', () => {
     console.log('[SHUTDOWN] Cleaning up...');
-    for (const [uid, claimer] of activeClaimers) {
-        claimer.stop();
-    }
+    for (const [uid, claimer] of activeClaimers) { claimer.stop(); }
     process.exit(0);
 });
 
