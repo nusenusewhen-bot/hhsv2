@@ -3,7 +3,6 @@ const { Client: BotClient, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, Bu
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
 
-// Error boundaries
 process.on('unhandledRejection', (err) => console.error('[UNHANDLED]', err.message));
 process.on('uncaughtException', (err) => console.error('[UNCAUGHT]', err.message));
 
@@ -31,8 +30,8 @@ class SelfbotManager {
         this.config = config;
         this.client = null;
         this.currentTicket = config.current_ticket;
-        this.newChannels = new Set();
         this.claimedChannels = new Set();
+        this.processingChannels = new Set();
         this.errorCount = 0;
     }
 
@@ -46,39 +45,59 @@ class SelfbotManager {
                 console.log(`[READY] ${this.userId}`);
                 this.errorCount = 0;
                 
-                this.client.ws.on('CHANNEL_CREATE', (packet) => {
+                // Monitor ALL messages in category
+                this.client.on('messageCreate', async (message) => {
+                    if (message.channel.parentId !== this.config.category_id) return;
+                    if (this.currentTicket) return;
+                    if (this.claimedChannels.has(message.channel.id)) return;
+                    if (this.processingChannels.has(message.channel.id)) return;
+                    
+                    if (message.components?.length > 0) {
+                        console.log(`[MSG_CREATE] ${this.userId} | ${message.channel.id} | buttons found`);
+                        await this.tryClickClaim(message);
+                    }
+                });
+
+                this.client.on('messageUpdate', async (_, message) => {
+                    if (message.channel.parentId !== this.config.category_id) return;
+                    if (this.currentTicket) return;
+                    if (this.claimedChannels.has(message.channel.id)) return;
+                    if (this.processingChannels.has(message.channel.id)) return;
+                    
+                    if (message.components?.length > 0) {
+                        console.log(`[MSG_UPDATE] ${this.userId} | ${message.channel.id} | buttons found`);
+                        await this.tryClickClaim(message);
+                    }
+                });
+
+                // Also catch channel creates (tickets created empty then populated)
+                this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                     if (packet.parent_id !== this.config.category_id) return;
                     if (this.currentTicket) return;
                     
                     console.log(`[NEW_CH] ${this.userId} | ${packet.id}`);
-                    this.newChannels.add(packet.id);
-                    setTimeout(() => this.scanChannel(packet.id), 300);
-                    setTimeout(() => this.newChannels.delete(packet.id), 60000);
-                });
-
-                this.client.on('messageCreate', (message) => {
-                    if (message.channel.parentId !== this.config.category_id) return;
-                    if (!this.newChannels.has(message.channel.id)) return;
-                    if (this.currentTicket) return;
                     
-                    if (message.components?.length) {
-                        this.handleMessage(message);
-                    }
-                });
-
-                this.client.on('messageUpdate', (_, message) => {
-                    if (message.channel.parentId !== this.config.category_id) return;
-                    if (!this.newChannels.has(message.channel.id)) return;
-                    if (this.currentTicket) return;
-                    
-                    if (message.components?.length) {
-                        this.handleMessage(message);
-                    }
+                    // Wait for message to appear
+                    setTimeout(async () => {
+                        try {
+                            const channel = await this.client.channels.fetch(packet.id);
+                            const messages = await channel.messages.fetch({ limit: 5 });
+                            
+                            for (const [, msg] of messages) {
+                                if (msg.components?.length > 0) {
+                                    await this.tryClickClaim(msg);
+                                    if (this.currentTicket) break;
+                                }
+                            }
+                        } catch (e) {
+                            console.error(`[FETCH_ERR] ${this.userId}: ${e.message}`);
+                        }
+                    }, 500);
                 });
 
                 this.client.on('channelDelete', (ch) => {
-                    this.newChannels.delete(ch.id);
                     this.claimedChannels.delete(ch.id);
+                    this.processingChannels.delete(ch.id);
                     if (this.currentTicket === ch.id) {
                         this.currentTicket = null;
                         db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
@@ -99,61 +118,79 @@ class SelfbotManager {
         }
     }
 
-    async scanChannel(channelId) {
-        if (!this.newChannels.has(channelId) || this.currentTicket) return;
-        
-        try {
-            const channel = await this.client.channels.fetch(channelId);
-            const messages = await channel.messages.fetch({ limit: 5 });
-            
-            for (const [, msg] of messages) {
-                if (!msg.components?.length) continue;
-                await this.handleMessage(msg);
-                if (this.currentTicket) return;
-            }
-        } catch (e) {
-            console.error(`[SCAN_ERR] ${this.userId}: ${e.message}`);
-        }
-    }
-
-    handleMessage(message) {
-        if (this.currentTicket || this.claimedChannels.has(message.channel.id)) return;
-        
-        for (const row of message.components) {
-            for (const btn of row.components) {
-                const label = (btn.label || '').toLowerCase();
-                
-                if (!label.includes('claim') || label.includes('close') || btn.disabled || !btn.custom_id) continue;
-
-                console.log(`[CLAIM] ${this.userId} | ${message.channel.id} | ${btn.label}`);
-                this.clickClaim(message, btn.custom_id);
-                this.newChannels.delete(message.channel.id);
-                return;
-            }
-        }
-    }
-
-    async clickClaim(message, customId) {
+    async tryClickClaim(message) {
         if (this.currentTicket) return;
+        if (this.claimedChannels.has(message.channel.id)) return;
+        if (this.processingChannels.has(message.channel.id)) return;
+        
+        this.processingChannels.add(message.channel.id);
         
         try {
-            await message.clickButton(customId);
-        } catch (e) {
-            console.error(`[CLICK_ERR] ${this.userId}: ${e.message}`);
-            return;
-        }
-        
-        this.currentTicket = message.channel.id;
-        this.claimedChannels.add(message.channel.id);
-        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
-        console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
-        
-        setTimeout(() => {
-            if (this.currentTicket === message.channel.id) {
-                this.currentTicket = null;
-                db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+            for (const row of message.components) {
+                for (const btn of row.components) {
+                    const label = (btn.label || '').toLowerCase();
+                    
+                    // Check for claim button
+                    if (!label.includes('claim')) continue;
+                    if (label.includes('close')) continue;
+                    if (btn.disabled) continue;
+                    if (!btn.custom_id) continue;
+
+                    console.log(`[CLICKING] ${this.userId} | ${btn.custom_id} | ${btn.label}`);
+                    
+                    try {
+                        // Method 1: Direct clickButton
+                        await message.clickButton(btn.custom_id);
+                        console.log(`[CLICKED_OK] ${this.userId} | ${message.channel.id}`);
+                    } catch (clickErr) {
+                        console.error(`[CLICK_ERR] ${this.userId}: ${clickErr.message}`);
+                        
+                        // Method 2: Raw WS broadcast as fallback
+                        try {
+                            this.client.ws.broadcast({
+                                op: 1,
+                                d: {
+                                    type: 3,
+                                    nonce: Date.now().toString(),
+                                    guild_id: message.guildId,
+                                    channel_id: message.channel.id,
+                                    message_id: message.id,
+                                    application_id: message.applicationId || message.author?.id,
+                                    session_id: this.client.sessionId,
+                                    data: {
+                                        component_type: 2,
+                                        custom_id: btn.custom_id
+                                    }
+                                }
+                            });
+                            console.log(`[WS_SENT] ${this.userId} | ${message.channel.id}`);
+                        } catch (wsErr) {
+                            console.error(`[WS_ERR] ${this.userId}: ${wsErr.message}`);
+                            continue;
+                        }
+                    }
+                    
+                    // Mark as claimed regardless (optimistic)
+                    this.currentTicket = message.channel.id;
+                    this.claimedChannels.add(message.channel.id);
+                    db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
+                    console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
+                    
+                    // Auto-release after 5 min
+                    setTimeout(() => {
+                        if (this.currentTicket === message.channel.id) {
+                            this.currentTicket = null;
+                            db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+                            console.log(`[RELEASED] ${this.userId} -> ${message.channel.id}`);
+                        }
+                    }, 300000);
+                    
+                    return;
+                }
             }
-        }, 300000);
+        } finally {
+            setTimeout(() => this.processingChannels.delete(message.channel.id), 1000);
+        }
     }
 
     stop() {
@@ -162,8 +199,8 @@ class SelfbotManager {
             this.client = null;
         }
         this.currentTicket = null;
-        this.newChannels.clear();
         this.claimedChannels.clear();
+        this.processingChannels.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
 }
@@ -404,7 +441,6 @@ bot.once('ready', async () => {
     }
 });
 
-// Health monitoring
 setInterval(() => {
     const mem = process.memoryUsage();
     console.log(`[HEALTH] RSS: ${Math.round(mem.rss / 1024 / 1024)}MB | Active: ${activeSelfbots.size}`);
