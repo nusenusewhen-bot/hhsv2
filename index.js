@@ -33,6 +33,8 @@ class SelfbotManager {
         this.claimedChannels = new Set();
         this.processingChannels = new Set();
         this.errorCount = 0;
+        this.pollInterval = null;
+        this.lastCheckedMessages = new Map();
     }
 
     async start() {
@@ -42,59 +44,34 @@ class SelfbotManager {
             this.client = new SelfbotClient({ checkUpdate: false });
 
             this.client.once('clientReady', () => {
-                console.log(`[READY] ${this.userId}`);
+                console.log(`[READY] ${this.userId} - ${this.client.user.tag}`);
                 this.errorCount = 0;
                 
-                // Listen for new messages in category
+                this.startPolling();
+                
                 this.client.on('messageCreate', async (message) => {
-                    if (message.channel.parentId !== this.config.category_id) return;
-                    if (this.currentTicket) return;
-                    if (this.claimedChannels.has(message.channel.id)) return;
-                    if (this.processingChannels.has(message.channel.id)) return;
-                    
-                    if (message.components?.length > 0) {
-                        console.log(`[MSG_CREATE] ${this.userId} | ${message.channel.id} | components: ${message.components.length}`);
-                        await this.tryClickClaim(message);
-                    }
-                });
-
-                // Listen for message updates (buttons added to existing messages)
-                this.client.on('messageUpdate', async (_, message) => {
-                    if (message.channel.parentId !== this.config.category_id) return;
-                    if (this.currentTicket) return;
-                    if (this.claimedChannels.has(message.channel.id)) return;
-                    if (this.processingChannels.has(message.channel.id)) return;
-                    
-                    if (message.components?.length > 0) {
-                        console.log(`[MSG_UPDATE] ${this.userId} | ${message.channel.id} | components: ${message.components.length}`);
-                        await this.tryClickClaim(message);
-                    }
-                });
-
-                // Handle new ticket channels
-                this.client.ws.on('CHANNEL_CREATE', async (packet) => {
-                    if (packet.parent_id !== this.config.category_id) return;
-                    if (this.currentTicket) return;
-                    
-                    console.log(`[NEW_CH] ${this.userId} | ${packet.id}`);
-                    
-                    // Wait a bit for the initial message to be sent
-                    setTimeout(async () => {
-                        try {
-                            const channel = await this.client.channels.fetch(packet.id);
-                            const messages = await channel.messages.fetch({ limit: 5 });
-                            
-                            for (const [, msg] of messages) {
-                                if (msg.components?.length > 0) {
-                                    console.log(`[SCAN] Found message with buttons in ${packet.id}`);
-                                    await this.tryClickClaim(msg);
-                                    if (this.currentTicket) break;
-                                }
-                            }
-                        } catch (e) {
-                            console.error(`[SCAN_ERR] ${this.userId}: ${e.message}`);
+                    console.log(`[EVENT_MSG_CREATE] ${message.channel.id}`);
+                    if (message.channel.parentId === this.config.category_id) {
+                        if (message.components?.length > 0) {
+                            await this.tryClickClaim(message);
                         }
-                    }, 1000);
+                    }
+                });
+
+                this.client.on('messageUpdate', async (_, message) => {
+                    console.log(`[EVENT_MSG_UPDATE] ${message.channel.id}`);
+                    if (message.channel.parentId === this.config.category_id) {
+                        if (message.components?.length > 0) {
+                            await this.tryClickClaim(message);
+                        }
+                    }
+                });
+
+                this.client.ws.on('CHANNEL_CREATE', async (packet) => {
+                    console.log(`[EVENT_CH_CREATE] ${packet.id}`);
+                    if (packet.parent_id === this.config.category_id) {
+                        setTimeout(() => this.pollChannel(packet.id), 1000);
+                    }
                 });
 
                 this.client.on('channelDelete', (ch) => {
@@ -120,54 +97,108 @@ class SelfbotManager {
         }
     }
 
-    async tryClickClaim(message) {
+    startPolling() {
+        this.pollInterval = setInterval(async () => {
+            if (this.currentTicket) return;
+            
+            try {
+                for (const [, guild] of this.client.guilds.cache) {
+                    const categoryChannels = guild.channels.cache.filter(
+                        ch => ch.parentId === this.config.category_id && ch.type === 0
+                    );
+                    
+                    for (const [, channel] of categoryChannels) {
+                        if (this.currentTicket) break;
+                        if (this.claimedChannels.has(channel.id)) continue;
+                        if (this.processingChannels.has(channel.id)) continue;
+                        
+                        await this.pollChannel(channel.id);
+                    }
+                }
+            } catch (e) {}
+        }, 500);
+        
+        console.log(`[POLLING_STARTED] ${this.userId}`);
+    }
+
+    async pollChannel(channelId) {
         if (this.currentTicket) return;
-        if (this.claimedChannels.has(message.channel.id)) return;
-        if (this.processingChannels.has(message.channel.id)) return;
+        if (this.claimedChannels.has(channelId)) return;
+        if (this.processingChannels.has(channelId)) return;
+        
+        try {
+            const channel = await this.client.channels.fetch(channelId);
+            if (!channel) return;
+            
+            const messages = await channel.messages.fetch({ limit: 5 });
+            
+            for (const [, msg] of messages) {
+                const lastChecked = this.lastCheckedMessages.get(msg.id);
+                if (lastChecked && Date.now() - lastChecked < 5000) continue;
+                this.lastCheckedMessages.set(msg.id, Date.now());
+                
+                if (this.lastCheckedMessages.size > 1000) {
+                    const now = Date.now();
+                    for (const [id, ts] of this.lastCheckedMessages) {
+                        if (now - ts > 60000) this.lastCheckedMessages.delete(id);
+                    }
+                }
+                
+                if (msg.components?.length > 0) {
+                    console.log(`[POLL_FOUND] ${channelId} | msg ${msg.id} | ${msg.components.length} components`);
+                    const claimed = await this.tryClickClaim(msg);
+                    if (claimed) return;
+                }
+            }
+        } catch (e) {}
+    }
+
+    async tryClickClaim(message) {
+        if (this.currentTicket) return false;
+        if (this.claimedChannels.has(message.channel.id)) return false;
+        if (this.processingChannels.has(message.channel.id)) return false;
         
         this.processingChannels.add(message.channel.id);
         
         try {
-            // Iterate through all action rows
-            for (let rowIndex = 0; rowIndex < message.components.length; rowIndex++) {
-                const row = message.components[rowIndex];
-                
-                // Iterate through all components in the row
-                for (let btnIndex = 0; btnIndex < row.components.length; btnIndex++) {
-                    const btn = row.components[btnIndex];
-                    
-                    // Must be a button (type 2)
+            for (const row of message.components) {
+                for (const btn of row.components) {
                     if (btn.type !== 2) continue;
                     
+                    // CASE INSENSITIVE CHECK - converts to lowercase
                     const label = (btn.label || '').toLowerCase();
                     
-                    // Skip if not claim button
+                    // CASE INSENSITIVE - checks for "claim" in any case
                     if (!label.includes('claim')) continue;
                     if (label.includes('close')) continue;
                     if (btn.disabled) continue;
                     if (!btn.custom_id) continue;
 
-                    console.log(`[FOUND] ${this.userId} | Row ${rowIndex} Btn ${btnIndex} | ${btn.custom_id} | "${btn.label}"`);
+                    console.log(`[ATTEMPT_CLICK] ${this.userId} | ${btn.custom_id} | "${btn.label}"`);
+                    
+                    let clicked = false;
                     
                     try {
-                        // Method 1: Use the button's click method directly
                         if (btn.click) {
                             await btn.click();
-                            console.log(`[CLICKED_V1] ${this.userId} | ${message.channel.id}`);
-                        } 
-                        // Method 2: Use message.clickButton with custom_id
-                        else if (message.clickButton) {
+                            console.log(`[CLICKED_V1] ${this.userId}`);
+                            clicked = true;
+                        }
+                    } catch (e1) {
+                        console.log(`[V1_FAIL] ${e1.message}`);
+                    }
+                    
+                    if (!clicked) {
+                        try {
                             await message.clickButton(btn.custom_id);
-                            console.log(`[CLICKED_V2] ${this.userId} | ${message.channel.id}`);
+                            console.log(`[CLICKED_V2] ${this.userId}`);
+                            clicked = true;
+                        } catch (e2) {
+                            console.log(`[V2_FAIL] ${e2.message}`);
                         }
-                        // Method 3: Raw HTTP fallback
-                        else {
-                            throw new Error('No click method available');
-                        }
-                    } catch (clickErr) {
-                        console.error(`[CLICK_ERR] ${this.userId}: ${clickErr.message}`);
-                        
-                        // Fallback: Manual HTTP request via client.api
+                    }
+                    
+                    if (!clicked) {
                         try {
                             await this.client.api.interactions.post({
                                 data: {
@@ -184,37 +215,43 @@ class SelfbotManager {
                                     }
                                 }
                             });
-                            console.log(`[CLICKED_V3] ${this.userId} | ${message.channel.id} (API fallback)`);
-                        } catch (apiErr) {
-                            console.error(`[API_ERR] ${this.userId}: ${apiErr.message}`);
-                            continue;
+                            console.log(`[CLICKED_V3] ${this.userId}`);
+                            clicked = true;
+                        } catch (e3) {
+                            console.log(`[V3_FAIL] ${e3.message}`);
                         }
                     }
                     
-                    // Mark as claimed
-                    this.currentTicket = message.channel.id;
-                    this.claimedChannels.add(message.channel.id);
-                    db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
-                    console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
-                    
-                    // Auto-release after 5 min
-                    setTimeout(() => {
-                        if (this.currentTicket === message.channel.id) {
-                            this.currentTicket = null;
-                            db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-                            console.log(`[RELEASED] ${this.userId} -> ${message.channel.id}`);
-                        }
-                    }, 300000);
-                    
-                    return;
+                    if (clicked) {
+                        this.currentTicket = message.channel.id;
+                        this.claimedChannels.add(message.channel.id);
+                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
+                        console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
+                        
+                        setTimeout(() => {
+                            if (this.currentTicket === message.channel.id) {
+                                this.currentTicket = null;
+                                db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+                                console.log(`[RELEASED] ${this.userId} -> ${message.channel.id}`);
+                            }
+                        }, 300000);
+                        
+                        return true;
+                    }
                 }
             }
         } finally {
             setTimeout(() => this.processingChannels.delete(message.channel.id), 2000);
         }
+        
+        return false;
     }
 
     stop() {
+        if (this.pollInterval) {
+            clearInterval(this.pollInterval);
+            this.pollInterval = null;
+        }
         if (this.client) {
             this.client.destroy();
             this.client = null;
@@ -222,6 +259,7 @@ class SelfbotManager {
         this.currentTicket = null;
         this.claimedChannels.clear();
         this.processingChannels.clear();
+        this.lastCheckedMessages.clear();
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
 }
