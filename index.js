@@ -71,8 +71,8 @@ class SelfbotManager {
                 console.log(`[EVENT_MSG_CREATE] ${message.channel.id} | parent: ${message.channel.parentId} | target: ${this.config.category_id}`);
                 if (message.channel.parentId !== this.config.category_id) return;
                 if (this.currentTicket) return;
-                if (message.components?.length > 0) {
-                    console.log(`[MSG_HAS_COMPONENTS] ${message.channel.id} | ${message.components.length} rows`);
+                if (message.components?.length > 0 || message.components?.size > 0) {
+                    console.log(`[MSG_HAS_COMPONENTS] ${message.channel.id} | components found`);
                     await this.tryClickClaim(message);
                 }
             });
@@ -81,7 +81,7 @@ class SelfbotManager {
                 console.log(`[EVENT_MSG_UPDATE] ${message.channel.id}`);
                 if (message.channel.parentId !== this.config.category_id) return;
                 if (this.currentTicket) return;
-                if (message.components?.length > 0) {
+                if (message.components?.length > 0 || message.components?.size > 0) {
                     await this.tryClickClaim(message);
                 }
             });
@@ -119,10 +119,8 @@ class SelfbotManager {
 
     startPolling() {
         console.log(`[POLLING_STARTED] ${this.userId} | category: ${this.config.category_id}`);
-        
         this.doPoll();
-        
-        this.pollInterval = setInterval(() => this.doPoll(), 100);
+        this.pollInterval = setInterval(() => this.doPoll(), 300); // Fixed: 300ms instead of 100ms
     }
 
     async doPoll() {
@@ -134,7 +132,6 @@ class SelfbotManager {
             for (const [, guild] of this.client.guilds.cache) {
                 console.log(`[CHECK_GUILD] ${guild.name} | ${guild.id}`);
                 
-                // FIX: Fetch all channels instead of using cache
                 let allChannels;
                 try {
                     allChannels = await guild.channels.fetch();
@@ -144,13 +141,12 @@ class SelfbotManager {
                     continue;
                 }
                 
-                const categoryChannels = allChannels.filter(
-                    ch => {
-                        const match = ch.parentId === this.config.category_id && ch.type === 0;
-                        if (match) console.log(`[FOUND_CH] ${ch.name} | ${ch.id} | parent: ${ch.parentId}`);
-                        return match;
-                    }
-                );
+                // Fixed: Use isTextBased() instead of type === 0
+                const categoryChannels = allChannels.filter(ch => {
+                    const match = ch.parentId === this.config.category_id && ch.isTextBased();
+                    if (match) console.log(`[FOUND_CH] ${ch.name} | ${ch.id} | type: ${ch.type} | isText: ${ch.isTextBased()}`);
+                    return match;
+                });
                 
                 console.log(`[CATEGORY_CHS] ${categoryChannels.size} channels in category ${this.config.category_id}`);
                 
@@ -188,13 +184,17 @@ class SelfbotManager {
                 return;
             }
             
+            // Fixed: Small delay for channel readiness
+            await new Promise(r => setTimeout(r, 500));
+            
             console.log(`[FETCH_MSGS] ${channelId}`);
             const messages = await channel.messages.fetch({ limit: 10 });
             console.log(`[FETCHED] ${channelId} | ${messages.size} messages`);
             
             for (const [, msg] of messages) {
+                // Fixed: Reduced skip window from 3000ms to 500ms
                 const lastChecked = this.lastCheckedMessages.get(msg.id);
-                if (lastChecked && Date.now() - lastChecked < 3000) continue;
+                if (lastChecked && Date.now() - lastChecked < 500) continue;
                 this.lastCheckedMessages.set(msg.id, Date.now());
                 
                 if (this.lastCheckedMessages.size > 1000) {
@@ -204,10 +204,12 @@ class SelfbotManager {
                     }
                 }
                 
-                console.log(`[CHECK_MSG] ${msg.id} | components: ${msg.components?.length || 0}`);
+                // Fixed: Check both .length and .size for components
+                const hasComponents = (msg.components?.length > 0) || (msg.components?.size > 0);
+                console.log(`[CHECK_MSG] ${msg.id} | hasComponents: ${hasComponents}`);
                 
-                if (msg.components?.length > 0) {
-                    console.log(`[HAS_COMPONENTS] ${msg.id} | ${msg.components.length} rows`);
+                if (hasComponents) {
+                    console.log(`[HAS_COMPONENTS] ${msg.id}`);
                     const claimed = await this.tryClickClaim(msg);
                     if (claimed) {
                         console.log(`[CLAIMED_IN_POLL] ${channelId}`);
@@ -235,92 +237,173 @@ class SelfbotManager {
         }
         
         try {
-            for (let rowIdx = 0; rowIdx < message.components.length; rowIdx++) {
-                const row = message.components[rowIdx];
-                console.log(`[CHECK_ROW] ${rowIdx} | ${row.components.length} buttons`);
+            // Fixed: Handle both Collection and Array
+            let components = message.components;
+            if (!components || (components.length === 0 && components.size === 0)) {
+                console.log(`[NO_COMPONENTS] ${message.id}`);
+                return false;
+            }
+            
+            // Convert Collection to Array if needed
+            const rows = components.values ? Array.from(components.values()) : components;
+            
+            for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+                const row = rows[rowIdx];
+                // Fixed: Handle nested components properly
+                let buttons = row.components;
+                if (buttons?.values) buttons = Array.from(buttons.values());
+                else if (!Array.isArray(buttons)) buttons = [];
                 
-                for (let btnIdx = 0; btnIdx < row.components.length; btnIdx++) {
-                    const btn = row.components[btnIdx];
-                    console.log(`[CHECK_BTN] ${btnIdx} | type: ${btn.type} | raw label: "${btn.label}" | customId: ${btn.custom_id} | disabled: ${btn.disabled}`);
+                console.log(`[CHECK_ROW] ${rowIdx} | ${buttons?.length || 0} buttons`);
+                
+                if (!buttons || buttons.length === 0) continue;
+                
+                for (let btnIdx = 0; btnIdx < buttons.length; btnIdx++) {
+                    const btn = buttons[btnIdx];
+                    if (!btn) continue;
                     
-                    if (btn.type !== 2) {
-                        console.log(`[SKIP_NOT_BTN] type=${btn.type}`);
+                    // Fixed: Robust property access (API uses camelCase)
+                    const rawLabel = (btn.label || btn.text || '').toString().toLowerCase();
+                    const customId = btn.customId || btn.custom_id;
+                    const isDisabled = btn.disabled === true;
+                    const componentType = btn.type || btn.componentType;
+                    
+                    console.log(`[CHECK_BTN] ${btnIdx} | type: ${componentType} | label: "${rawLabel}" | customId: ${customId} | disabled: ${isDisabled}`);
+
+                    // Check if it's a button (type 2)
+                    if (componentType !== 2 && componentType !== 'BUTTON') {
+                        console.log(`[SKIP_NOT_BTN] type=${componentType}`);
                         continue;
                     }
                     
-                    const rawLabel = (btn.label || '').toLowerCase();
-                    const label = rawLabel.replace(/[^a-z0-9]/g, '');
-                    console.log(`[LABEL_CLEANED] "${rawLabel}" -> "${label}" | includes 'claim'? ${label.includes('claim')}`);
+                    // Fixed: EXPANDED label detection
+                    const claimKeywords = /(claim|accept|take|open|get|create|start|new|ticket)/i;
+                    const closeKeywords = /(close|delete|end|cancel|shutdown)/i;
                     
-                    if (!label.includes('claim')) {
-                        console.log(`[SKIP_NO_CLAIM] cleaned label: "${label}"`);
+                    console.log(`[LABEL_CHECK] raw: "${rawLabel}" | claimMatch: ${claimKeywords.test(rawLabel)} | closeMatch: ${closeKeywords.test(rawLabel)}`);
+                    
+                    // Must match claim keywords, must NOT be close-only button
+                    if (!claimKeywords.test(rawLabel)) {
+                        console.log(`[SKIP_NO_CLAIM_KEYWORD]`);
                         continue;
                     }
-                    if (label.includes('close')) {
-                        console.log(`[SKIP_CLOSE]`);
+                    if (closeKeywords.test(rawLabel) && !claimKeywords.test(rawLabel.replace(/[^a-z]/gi, ''))) {
+                        console.log(`[SKIP_CLOSE_KEYWORD]`);
                         continue;
                     }
-                    if (btn.disabled) {
+                    if (isDisabled) {
                         console.log(`[SKIP_DISABLED]`);
                         continue;
                     }
-                    if (!btn.custom_id) {
+                    if (!customId) {
                         console.log(`[SKIP_NO_CUSTOM_ID]`);
                         continue;
                     }
 
-                    console.log(`[ATTEMPT_CLICK] ${btn.custom_id} | "${btn.label}"`);
+                    console.log(`[ATTEMPT_CLICK] ${customId} | "${rawLabel}"`);
                     
                     let clicked = false;
-                    let clickError = '';
-                    
-                    try {
-                        if (btn.click) {
+                    let lastError = '';
+
+                    // Method 1: Direct button click
+                    if (!clicked && typeof btn.click === 'function') {
+                        try {
                             console.log(`[TRY_BTN_CLICK]`);
                             await btn.click();
                             clicked = true;
                             console.log(`[CLICKED_V1]`);
+                        } catch (e) {
+                            lastError = `V1: ${e.message}`;
+                            console.log(`[V1_FAIL] ${e.message}`);
                         }
-                    } catch (e1) {
-                        clickError = e1.message;
-                        console.log(`[V1_FAIL] ${e1.message}`);
                     }
-                    
+
+                    // Method 2: Message clickButton
                     if (!clicked) {
                         try {
-                            console.log(`[TRY_MSG_CLICK] ${btn.custom_id}`);
-                            await message.clickButton(btn.custom_id);
+                            console.log(`[TRY_MSG_CLICK] ${customId}`);
+                            await message.clickButton(customId);
                             clicked = true;
                             console.log(`[CLICKED_V2]`);
-                        } catch (e2) {
-                            clickError = e2.message;
-                            console.log(`[V2_FAIL] ${e2.message}`);
+                        } catch (e) {
+                            lastError = `V2: ${e.message}`;
+                            console.log(`[V2_FAIL] ${e.message}`);
                         }
                     }
                     
+                    // Method 3: REST API with proper structure
                     if (!clicked) {
                         try {
                             console.log(`[TRY_API_CLICK]`);
-                            await this.client.api.interactions.post({
+                            
+                            const sessionId = this.client.sessionId || 
+                                             this.client.ws?.sessionId || 
+                                             this.client.gatewaySession;
+                                             
+                            if (!sessionId) {
+                                throw new Error('No session ID available');
+                            }
+
+                            const payload = {
+                                type: 3,
+                                nonce: `${Date.now()}${Math.floor(Math.random() * 1000000)}`,
+                                guild_id: message.guildId || message.guild?.id,
+                                channel_id: message.channel.id,
+                                message_id: message.id,
+                                application_id: message.applicationId || message.author?.id,
+                                session_id: sessionId,
                                 data: {
+                                    component_type: 2,
+                                    custom_id: customId
+                                }
+                            };
+
+                            await this.client.rest.post('/interactions', { body: payload });
+                            clicked = true;
+                            console.log(`[CLICKED_V3]`);
+                        } catch (e) {
+                            lastError = `V3: ${e.message}`;
+                            console.log(`[V3_FAIL] ${e.message}`);
+                        }
+                    }
+
+                    // Method 4: Raw fetch (nuclear option)
+                    if (!clicked) {
+                        try {
+                            console.log(`[TRY_V4_RAW]`);
+                            const sessionId = this.client.sessionId || this.client.ws?.sessionId;
+                            
+                            const res = await fetch('https://discord.com/api/v9/interactions', {
+                                method: 'POST',
+                                headers: {
+                                    'Authorization': this.config.token,
+                                    'Content-Type': 'application/json',
+                                    'X-Super-Properties': this.client.options?.http?.headers?.['X-Super-Properties'] || ''
+                                },
+                                body: JSON.stringify({
                                     type: 3,
-                                    nonce: Date.now().toString(),
+                                    nonce: `${Date.now()}${Math.floor(Math.random() * 1000000)}`,
                                     guild_id: message.guildId,
                                     channel_id: message.channel.id,
                                     message_id: message.id,
                                     application_id: message.applicationId || message.author?.id,
-                                    session_id: this.client.sessionId,
+                                    session_id: sessionId,
                                     data: {
                                         component_type: 2,
-                                        custom_id: btn.custom_id
+                                        custom_id: customId
                                     }
-                                }
+                                })
                             });
-                            clicked = true;
-                            console.log(`[CLICKED_V3]`);
-                        } catch (e3) {
-                            clickError = e3.message;
-                            console.log(`[V3_FAIL] ${e3.message}`);
+                            
+                            if (res.ok) {
+                                clicked = true;
+                                console.log(`[CLICKED_V4]`);
+                            } else {
+                                throw new Error(`HTTP ${res.status}`);
+                            }
+                        } catch (e) {
+                            lastError = `V4: ${e.message}`;
+                            console.log(`[V4_FAIL] ${e.message}`);
                         }
                     }
                     
@@ -330,22 +413,25 @@ class SelfbotManager {
                         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
                         console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
                         
+                        // Fixed: 2 minute auto-release instead of 5
                         setTimeout(() => {
                             if (this.currentTicket === message.channel.id) {
                                 this.currentTicket = null;
                                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
                                 console.log(`[RELEASED] ${this.userId} -> ${message.channel.id}`);
                             }
-                        }, 300000);
+                        }, 120000);
                         
                         return true;
                     } else {
-                        console.log(`[ALL_CLICKS_FAILED] last error: ${clickError}`);
+                        console.log(`[ALL_CLICKS_FAILED] ${lastError}`);
+                        db.prepare('UPDATE users SET last_error = ? WHERE user_id = ?').run(lastError.substring(0, 200), this.userId);
                     }
                 }
             }
         } catch (e) {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
+            console.error(e.stack);
         }
         
         console.log(`[NO_CLAIM_BTN_FOUND] ${message.id}`);
@@ -402,7 +488,8 @@ async function buildPanel(userId) {
             { name: 'Status', value: running ? '🟢 Running' : '🔴 Stopped', inline: true },
             { name: 'Token', value: hasToken ? '✅ Set' : '❌ Not set', inline: true },
             { name: 'Category', value: hasCategory ? '✅ Set' : '❌ Not set', inline: true },
-            { name: 'Current', value: user.current_ticket || 'None', inline: true }
+            { name: 'Current', value: user.current_ticket || 'None', inline: true },
+            { name: 'Last Error', value: user.last_error || 'None', inline: false }
         )
         .setColor(running ? 0x00FF00 : 0xFFA500);
 
