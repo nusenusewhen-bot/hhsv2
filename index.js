@@ -134,7 +134,17 @@ class SelfbotManager {
             for (const [, guild] of this.client.guilds.cache) {
                 console.log(`[CHECK_GUILD] ${guild.name} | ${guild.id}`);
                 
-                const categoryChannels = guild.channels.cache.filter(
+                // FIX: Fetch all channels instead of using cache
+                let allChannels;
+                try {
+                    allChannels = await guild.channels.fetch();
+                    console.log(`[FETCHED_CHANNELS] ${guild.name} | ${allChannels.size} channels`);
+                } catch (e) {
+                    console.log(`[FETCH_CHANNELS_FAIL] ${guild.name}: ${e.message}`);
+                    continue;
+                }
+                
+                const categoryChannels = allChannels.filter(
                     ch => {
                         const match = ch.parentId === this.config.category_id && ch.type === 0;
                         if (match) console.log(`[FOUND_CH] ${ch.name} | ${ch.id} | parent: ${ch.parentId}`);
