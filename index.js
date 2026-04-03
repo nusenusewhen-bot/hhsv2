@@ -24,12 +24,6 @@ if (!BOT_TOKEN || !OWNER_ID) {
 const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const activeSelfbots = new Map();
 
-// Helper to check if message has components (works with both Array and Collection)
-const hasComponents = (msg) => {
-    const comps = msg.components;
-    return comps && (comps.length > 0 || comps.size > 0);
-};
-
 class SelfbotManager {
     constructor(userId, config) {
         this.userId = userId;
@@ -38,11 +32,11 @@ class SelfbotManager {
         this.currentTicket = config.current_ticket;
         this.claimedChannels = new Set();
         this.processingChannels = new Set();
-        this.claimingChannels = new Set(); // NEW: Anti-double-click protection
-        this.processedMessages = new Set(); // NEW: Message deduplication
+        this.claimingInProgress = new Set(); // Anti-double-click
         this.errorCount = 0;
         this.pollInterval = null;
         this.readyFired = false;
+        this.lastClaimTime = 0; // Global throttle
     }
 
     async start() {
@@ -67,32 +61,33 @@ class SelfbotManager {
                 if (!this.readyFired) readyHandler();
             }, 10000);
 
-            // OPTIMIZED: Single message handler function
-            const handleMessage = async (message) => {
-                if (message.channel.parentId !== this.config.category_id) return;
+            // FAST: Immediate event handlers
+            this.client.on('messageCreate', async (message) => {
                 if (this.currentTicket) return;
-                if (this.processedMessages.has(message.id)) return; // Deduplication
-                
-                if (hasComponents(message)) {
-                    this.processedMessages.add(message.id);
-                    // Auto-cleanup after 30s to prevent memory bloat
-                    setTimeout(() => this.processedMessages.delete(message.id), 30000);
+                if (message.channel.parentId !== this.config.category_id) return;
+                if (this.hasComponents(message)) {
                     await this.tryClickClaim(message);
                 }
-            };
+            });
 
-            this.client.on('messageCreate', handleMessage);
-            this.client.on('messageUpdate', (_, message) => handleMessage(message));
+            this.client.on('messageUpdate', async (_, message) => {
+                if (this.currentTicket) return;
+                if (message.channel.parentId !== this.config.category_id) return;
+                if (this.hasComponents(message)) {
+                    await this.tryClickClaim(message);
+                }
+            });
 
             this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                 if (packet.parent_id !== this.config.category_id) return;
-                setTimeout(() => this.pollChannel(packet.id), 100); // Reduced from 300ms
+                // Instant poll
+                this.pollChannel(packet.id);
             });
 
             this.client.on('channelDelete', (ch) => {
                 this.claimedChannels.delete(ch.id);
                 this.processingChannels.delete(ch.id);
-                this.claimingChannels.delete(ch.id); // Cleanup anti-double-click
+                this.claimingInProgress.delete(ch.id);
                 if (this.currentTicket === ch.id) {
                     this.currentTicket = null;
                     db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
@@ -112,50 +107,47 @@ class SelfbotManager {
         }
     }
 
+    hasComponents(msg) {
+        // Check both array and collection formats
+        const c = msg.components;
+        if (!c) return false;
+        if (Array.isArray(c) && c.length > 0) return true;
+        if (c.size > 0) return true;
+        return false;
+    }
+
     startPolling() {
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 100); // Faster: 100ms vs 150ms
+        this.pollInterval = setInterval(() => this.doPoll(), 100);
     }
 
     async doPoll() {
         if (this.currentTicket) return;
         try {
-            // OPTIMIZED: Process guilds in parallel
-            const guildPromises = [];
             for (const [, guild] of this.client.guilds.cache) {
-                guildPromises.push(this.pollGuild(guild));
+                let allChannels;
+                try { allChannels = await guild.channels.fetch(); } catch { continue; }
+                
+                const categoryChannels = allChannels.filter(ch => 
+                    ch.parentId === this.config.category_id && ch.isTextBased()
+                );
+                
+                // Fast sequential to avoid rate limits
+                for (const [, channel] of categoryChannels) {
+                    if (this.currentTicket) break;
+                    if (this.claimedChannels.has(channel.id) || this.processingChannels.has(channel.id)) continue;
+                    
+                    // Non-blocking fire-and-forget with instant check
+                    this.pollChannel(channel.id);
+                }
             }
-            await Promise.all(guildPromises);
         } catch (e) {
             console.error(`[POLL_ERR] ${this.userId}: ${e.message}`);
         }
     }
 
-    async pollGuild(guild) {
-        try {
-            const allChannels = await guild.channels.fetch();
-            const categoryChannels = allChannels.filter(ch => 
-                ch.parentId === this.config.category_id && ch.isTextBased()
-            );
-            
-            // OPTIMIZED: Process channels in parallel batches of 5
-            const channels = Array.from(categoryChannels.values());
-            const batchSize = 5;
-            
-            for (let i = 0; i < channels.length; i += batchSize) {
-                if (this.currentTicket) break;
-                const batch = channels.slice(i, i + batchSize);
-                await Promise.all(batch.map(ch => this.pollChannel(ch.id)));
-            }
-        } catch {
-            // Silent fail for guild fetch errors
-        }
-    }
-
     async pollChannel(channelId) {
-        // ANTI-DOUBLE-CLICK: Check claimingChannels
-        if (this.currentTicket || this.claimedChannels.has(channelId) || 
-            this.processingChannels.has(channelId) || this.claimingChannels.has(channelId)) return;
+        if (this.currentTicket || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
         
         this.processingChannels.add(channelId);
         
@@ -163,94 +155,177 @@ class SelfbotManager {
             const channel = await this.client.channels.fetch(channelId);
             if (!channel) return;
             
-            // Reduced delay from 200ms to 50ms
-            await new Promise(r => setTimeout(r, 50));
+            // No delay - instant fetch
+            const messages = await channel.messages.fetch({ limit: 3 });
             
-            const messages = await channel.messages.fetch({ limit: 5 }); // Reduced from 10 to 5 for speed
-            
-            // Check messages in parallel
-            const checkPromises = [];
-            for (const [, msg] of messages) {
-                if (hasComponents(msg) && !this.processedMessages.has(msg.id)) {
-                    this.processedMessages.add(msg.id);
-                    setTimeout(() => this.processedMessages.delete(msg.id), 30000);
-                    checkPromises.push(this.tryClickClaim(msg));
+            // Check newest first (most likely to have unclaimed button)
+            const msgArray = Array.from(messages.values());
+            for (const msg of msgArray) {
+                if (this.currentTicket) break;
+                if (this.hasComponents(msg)) {
+                    const claimed = await this.tryClickClaim(msg);
+                    if (claimed) return;
                 }
             }
-            
-            // Race to find first successful claim
-            if (checkPromises.length > 0) {
-                await Promise.race([
-                    Promise.all(checkPromises),
-                    new Promise(r => setTimeout(r, 500)) // Timeout after 500ms
-                ]);
-            }
         } catch (e) {
-            // Silent fail
+            // Silent
         } finally {
-            setTimeout(() => this.processingChannels.delete(channelId), 100); // Reduced from 500ms
+            // Quick cleanup
+            setTimeout(() => this.processingChannels.delete(channelId), 50);
         }
     }
 
     async tryClickClaim(message) {
-        // MULTI-LAYER ANTI-DOUBLE-CLICK CHECK
+        // ANTI-DOUBLE-CLICK: Multiple guard layers
         if (this.currentTicket) return false;
         if (this.claimedChannels.has(message.channel.id)) return false;
-        if (this.claimingChannels.has(message.channel.id)) return false; // Already claiming
+        if (this.claimingInProgress.has(message.channel.id)) return false;
         
-        // ATOMIC CLAIM LOCK
-        this.claimingChannels.add(message.channel.id);
+        // Global claim throttle (prevent double clicks across events)
+        const now = Date.now();
+        if (now - this.lastClaimTime < 500) return false; // 500ms global throttle
+        
+        // LOCK: Mark as claiming immediately
+        this.claimingInProgress.add(message.channel.id);
         
         try {
             const components = message.components;
-            if (!components) return false;
+            if (!components || (!components.length && !components.size)) {
+                return false;
+            }
             
-            // Fast array conversion
-            const rows = Array.isArray(components) ? components : Array.from(components.values());
-            if (rows.length === 0) return false;
+            // Convert to array reliably
+            let rows;
+            if (Array.isArray(components)) {
+                rows = components;
+            } else if (components.values) {
+                rows = Array.from(components.values());
+            } else {
+                rows = [components]; // Single row case
+            }
             
-            // Pre-compute regex patterns (faster than creating each iteration)
-            const claimKeywords = /(claim|accept|take|open|get|start|new|ticket)/i;
-            const closeKeywords = /(close|delete|end|cancel|shutdown|finish|archive)/i;
+            if (!rows.length) return false;
+            
+            const claimRegex = /(claim|accept|take|open|get|start|new|ticket)/i;
+            const closeRegex = /(close|delete|end|cancel|shutdown|finish|archive)/i;
             
             for (const row of rows) {
-                const buttons = row.components?.values ? 
-                    Array.from(row.components.values()) : 
-                    (Array.isArray(row.components) ? row.components : []);
+                if (!row || !row.components) continue;
+                
+                // Get buttons array
+                let buttons;
+                if (Array.isArray(row.components)) {
+                    buttons = row.components;
+                } else if (row.components.values) {
+                    buttons = Array.from(row.components.values());
+                } else {
+                    buttons = [row.components];
+                }
                 
                 for (const btn of buttons) {
                     if (!btn) continue;
                     
-                    const rawLabel = (btn.label || btn.text || '').toString().trim().toLowerCase();
-                    const customId = btn.customId || btn.custom_id;
+                    // Extract properties with fallbacks
+                    const label = (btn.label || btn.text || '').toString().trim().toLowerCase();
+                    const customId = btn.customId || btn.custom_id || btn.data?.custom_id;
+                    const disabled = btn.disabled === true;
+                    const type = btn.type || btn.componentType || btn.data?.component_type;
                     
-                    // Fast checks first
-                    if (btn.disabled) continue;
+                    // Must be button, not disabled, has customId
+                    if (type !== 2 && type !== 'BUTTON') continue;
+                    if (disabled) continue;
                     if (!customId) continue;
-                    if (btn.type !== 2 && btn.componentType !== 2 && btn.type !== 'BUTTON') continue;
                     
-                    // Label checks
-                    if (closeKeywords.test(rawLabel)) continue;
-                    if (!claimKeywords.test(rawLabel)) continue;
-
-                    console.log(`[ATTEMPT_CLICK] ${this.userId} | ${customId} | "${rawLabel}"`);
-
-                    // OPTIMIZED: Sequential attempts with early return
-                    const clicked = await this.executeClick(message, btn, customId);
+                    // Must match claim, not close
+                    if (closeRegex.test(label)) continue;
+                    if (!claimRegex.test(label)) continue;
                     
-                    if (clicked) {
-                        // SUCCESS - Mark as claimed immediately
+                    console.log(`[CLAIM_TRY] ${this.userId} | ${customId} | "${label}"`);
+                    
+                    // FAST CLAIM: Try all methods immediately
+                    let success = false;
+                    const sessionId = this.client.sessionId || this.client.ws?.sessionId;
+                    
+                    // Method 1: Direct button click (fastest)
+                    if (!success && typeof btn.click === 'function') {
+                        try {
+                            await btn.click();
+                            success = true;
+                        } catch (e) {
+                            // console.log(`[CLICK_FAIL_1] ${e.message}`);
+                        }
+                    }
+                    
+                    // Method 2: Message clickButton
+                    if (!success && typeof message.clickButton === 'function') {
+                        try {
+                            await message.clickButton(customId);
+                            success = true;
+                        } catch (e) {
+                            // console.log(`[CLICK_FAIL_2] ${e.message}`);
+                        }
+                    }
+                    
+                    // Method 3: REST API
+                    if (!success && sessionId) {
+                        try {
+                            const payload = {
+                                type: 3,
+                                nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
+                                guild_id: message.guildId || message.guild?.id,
+                                channel_id: message.channel.id,
+                                message_id: message.id,
+                                application_id: message.applicationId || message.author?.id,
+                                session_id: sessionId,
+                                data: { component_type: 2, custom_id: customId }
+                            };
+                            await this.client.rest.post('/interactions', { body: payload });
+                            success = true;
+                        } catch (e) {
+                            // console.log(`[CLICK_FAIL_3] ${e.message}`);
+                        }
+                    }
+                    
+                    // Method 4: Raw fetch
+                    if (!success && sessionId) {
+                        try {
+                            const res = await fetch('https://discord.com/api/v9/interactions', {
+                                method: 'POST',
+                                headers: { 
+                                    'Authorization': this.config.token, 
+                                    'Content-Type': 'application/json' 
+                                },
+                                body: JSON.stringify({
+                                    type: 3,
+                                    nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
+                                    guild_id: message.guildId || message.guild?.id,
+                                    channel_id: message.channel.id,
+                                    message_id: message.id,
+                                    application_id: message.applicationId || message.author?.id,
+                                    session_id: sessionId,
+                                    data: { component_type: 2, custom_id: customId }
+                                })
+                            });
+                            if (res.ok || res.status === 204) success = true;
+                        } catch (e) {
+                            // console.log(`[CLICK_FAIL_4] ${e.message}`);
+                        }
+                    }
+                    
+                    if (success) {
+                        // SUCCESS - Mark claimed
+                        this.lastClaimTime = Date.now();
                         this.currentTicket = message.channel.id;
                         this.claimedChannels.add(message.channel.id);
                         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
                         console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
-
-                        // Release lock after delay to prevent double-clicks from other events
+                        
+                        // Keep lock for 2 seconds to prevent any double-click
                         setTimeout(() => {
-                            this.claimingChannels.delete(message.channel.id);
-                        }, 3000);
-
-                        // Auto-release ticket after 2 minutes
+                            this.claimingInProgress.delete(message.channel.id);
+                        }, 2000);
+                        
+                        // Auto-release after 2 minutes
                         setTimeout(() => {
                             if (this.currentTicket === message.channel.id) {
                                 this.currentTicket = null;
@@ -266,64 +341,11 @@ class SelfbotManager {
         } catch (e) {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
         } finally {
-            // Always release claiming lock if not successful
-            if (this.claimingChannels.has(message.channel.id) && this.currentTicket !== message.channel.id) {
-                this.claimingChannels.delete(message.channel.id);
+            // Release lock if not claimed (claimed has its own timeout)
+            if (!this.claimedChannels.has(message.channel.id)) {
+                this.claimingInProgress.delete(message.channel.id);
             }
         }
-        return false;
-    }
-
-    // SEPARATED: Click execution for cleaner code and faster execution
-    async executeClick(message, btn, customId) {
-        const sessionId = this.client.sessionId || this.client.ws?.sessionId;
-        if (!sessionId) return false;
-
-        const nonce = `${Date.now()}${Math.floor(Math.random() * 1000000)}`;
-        const payload = {
-            type: 3,
-            nonce,
-            guild_id: message.guildId,
-            channel_id: message.channel.id,
-            message_id: message.id,
-            application_id: message.applicationId || message.author?.id,
-            session_id: sessionId,
-            data: { component_type: 2, custom_id: customId }
-        };
-
-        // Attempt 1: Native button click (fastest)
-        if (typeof btn.click === 'function') {
-            try {
-                await btn.click();
-                return true;
-            } catch {}
-        }
-
-        // Attempt 2: Message clickButton method
-        try {
-            await message.clickButton(customId);
-            return true;
-        } catch {}
-
-        // Attempt 3: REST API call
-        try {
-            await this.client.rest.post('/interactions', { body: payload });
-            return true;
-        } catch {}
-
-        // Attempt 4: Fetch API (last resort)
-        try {
-            const res = await fetch('https://discord.com/api/v9/interactions', {
-                method: 'POST',
-                headers: { 
-                    'Authorization': this.config.token, 
-                    'Content-Type': 'application/json' 
-                },
-                body: JSON.stringify(payload)
-            });
-            return res.ok;
-        } catch {}
-
         return false;
     }
 
@@ -333,8 +355,7 @@ class SelfbotManager {
         this.currentTicket = null;
         this.claimedChannels.clear();
         this.processingChannels.clear();
-        this.claimingChannels.clear();
-        this.processedMessages.clear();
+        this.claimingInProgress.clear();
         this.readyFired = false;
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
