@@ -78,7 +78,7 @@ class SelfbotManager {
 
             this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                 if (packet.parent_id !== this.config.category_id) return;
-                setTimeout(() => this.pollChannel(packet.id), 1000);
+                setTimeout(() => this.pollChannel(packet.id), 300);
             });
 
             this.client.on('channelDelete', (ch) => {
@@ -105,7 +105,7 @@ class SelfbotManager {
 
     startPolling() {
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 300);
+        this.pollInterval = setInterval(() => this.doPoll(), 150);
     }
 
     async doPoll() {
@@ -137,7 +137,7 @@ class SelfbotManager {
         try {
             const channel = await this.client.channels.fetch(channelId);
             if (!channel) return;
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 200));
             
             const messages = await channel.messages.fetch({ limit: 10 });
             
@@ -151,7 +151,7 @@ class SelfbotManager {
         } catch (e) {
             console.error(`[POLL_CH_ERR] ${channelId}: ${e.message}`);
         } finally {
-            setTimeout(() => this.processingChannels.delete(channelId), 1000);
+            setTimeout(() => this.processingChannels.delete(channelId), 500);
         }
     }
 
