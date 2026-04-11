@@ -61,22 +61,24 @@ class SelfbotManager {
                 if (!this.readyFired) readyHandler();
             }, 10000);
 
-            // FAST: Raw WebSocket event for instant channel create detection
+            // INSTANT: WebSocket-level channel create detection
             this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                 if (this.currentTicket) return;
                 if (packet.parent_id !== this.config.category_id) return;
-                const channelId = packet.id;
-                if (!channelId || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
-                this.instantPollChannel(channelId);
+                if (!packet.id || this.claimedChannels.has(packet.id)) return;
+                
+                // IMMEDIATE: Race to fetch and claim without waiting
+                this.raceToClaim(packet.id);
             });
 
-            // Backup regular handler
             this.client.on('channelCreate', async (channel) => {
                 if (this.currentTicket) return;
                 if (channel.parentId !== this.config.category_id) return;
-                this.instantPollChannel(channel.id);
+                if (this.claimedChannels.has(channel.id)) return;
+                this.raceToClaim(channel.id);
             });
 
+            // FAST: Gateway message events are instant, no fetch needed
             this.client.on('messageCreate', async (message) => {
                 if (this.currentTicket) return;
                 if (message.channel.parentId !== this.config.category_id) return;
@@ -126,82 +128,86 @@ class SelfbotManager {
 
     startPolling() {
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 100);
+        this.pollInterval = setInterval(() => this.doPoll(), 20); // 20ms ultra-fast polling
     }
 
     async doPoll() {
         if (this.currentTicket) return;
         try {
             for (const [, guild] of this.client.guilds.cache) {
-                let allChannels;
-                try { allChannels = await guild.channels.fetch(); } catch { continue; }
-                
-                const categoryChannels = allChannels.filter(ch => 
+                const categoryChannels = guild.channels.cache.filter(ch => 
                     ch.parentId === this.config.category_id && ch.isTextBased()
                 );
                 
                 for (const [, channel] of categoryChannels) {
                     if (this.currentTicket) break;
                     if (this.claimedChannels.has(channel.id) || this.processingChannels.has(channel.id)) continue;
-                    this.instantPollChannel(channel.id);
+                    this.raceToClaim(channel.id);
                 }
             }
         } catch (e) {
-            console.error(`[POLL_ERR] ${this.userId}: ${e.message}`);
+            // Silent for speed
         }
     }
 
-    async instantPollChannel(channelId) {
+    // RACE: Fetch and claim as fast as possible
+    async raceToClaim(channelId) {
         if (this.currentTicket || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
         
         this.processingChannels.add(channelId);
         
         try {
-            // Cache first for speed
-            let channel = this.client.channels.cache.get(channelId);
+            // Use cache first, skip if not cached to save time
+            const channel = this.client.channels.cache.get(channelId);
             if (!channel) {
-                channel = await this.client.channels.fetch(channelId);
-            }
-            if (!channel) {
-                this.processingChannels.delete(channelId);
-                return;
-            }
-            
-            // No delay - instant fetch
-            const messages = await channel.messages.fetch({ limit: 3 });
-            
-            const msgArray = Array.from(messages.values());
-            for (const msg of msgArray) {
-                if (this.currentTicket) break;
-                if (this.hasComponents(msg)) {
-                    const claimed = await this.tryClickClaim(msg);
-                    if (claimed) {
-                        this.processingChannels.delete(channelId);
-                        return;
+                // Only fetch if not in cache, but do it fast
+                const fetched = await this.client.channels.fetch(channelId).catch(() => null);
+                if (!fetched || !fetched.isTextBased()) {
+                    this.processingChannels.delete(channelId);
+                    return;
+                }
+                
+                // Fetch last message only
+                const messages = await fetched.messages.fetch({ limit: 1 }).catch(() => null);
+                if (messages && messages.size > 0) {
+                    const msg = messages.first();
+                    if (this.hasComponents(msg)) {
+                        await this.tryClickClaim(msg);
+                    }
+                }
+            } else {
+                // If cached, check last message immediately
+                if (channel.lastMessageId) {
+                    const msg = channel.messages.cache.get(channel.lastMessageId);
+                    if (msg && this.hasComponents(msg)) {
+                        await this.tryClickClaim(msg);
                     }
                 }
             }
-        } catch (e) {
-            // Silent
-        } finally {
-            setTimeout(() => this.processingChannels.delete(channelId), 50);
-        }
+        } catch (e) {}
+        
+        setTimeout(() => this.processingChannels.delete(channelId), 10);
     }
 
     async tryClickClaim(message) {
-        // ANTI-DOUBLE-CLICK: Multiple guard layers
+        // STRICT: If we have a ticket, stop immediately
         if (this.currentTicket) return false;
-        if (this.claimedChannels.has(message.channel.id)) return false;
-        if (this.claimingInProgress.has(message.channel.id)) return false;
+        
+        const channelId = message.channel.id;
+        const messageId = message.id;
+        
+        if (this.claimedChannels.has(channelId)) return false;
+        if (this.claimingInProgress.has(channelId)) return false;
         
         const now = Date.now();
-        if (now - this.lastClaimTime < 500) return false;
+        if (now - this.lastClaimTime < 100) return false; // 100ms throttle only
         
-        this.claimingInProgress.add(message.channel.id);
+        this.claimingInProgress.add(channelId);
         
         try {
             const components = message.components;
             if (!components || (!components.length && !components.size)) {
+                this.claimingInProgress.delete(channelId);
                 return false;
             }
             
@@ -214,7 +220,10 @@ class SelfbotManager {
                 rows = [components];
             }
             
-            if (!rows.length) return false;
+            if (!rows.length) {
+                this.claimingInProgress.delete(channelId);
+                return false;
+            }
             
             const claimRegex = /(claim|accept|take|open|get|start|new|ticket)/i;
             const closeRegex = /(close|delete|end|cancel|shutdown|finish|archive)/i;
@@ -247,85 +256,109 @@ class SelfbotManager {
                     
                     console.log(`[CLAIM_TRY] ${this.userId} | ${customId} | "${label}"`);
                     
-                    // SEQUENTIAL: Try methods one by one (original logic)
-                    let success = false;
+                    // ULTRA-FAST: Race all methods simultaneously
+                    const now = Date.now();
                     const sessionId = this.client.sessionId || this.client.ws?.sessionId;
+                    const nonce = `${now}${Math.floor(Math.random() * 1000000)}`;
+                    
+                    const promises = [];
                     
                     // Method 1: Direct button click
-                    if (!success && typeof btn.click === 'function') {
-                        try {
-                            await btn.click();
-                            success = true;
-                        } catch (e) {}
+                    if (typeof btn.click === 'function') {
+                        promises.push(
+                            (async () => {
+                                try {
+                                    await btn.click();
+                                    return true;
+                                } catch (e) { return false; }
+                            })()
+                        );
                     }
                     
                     // Method 2: Message clickButton
-                    if (!success && typeof message.clickButton === 'function') {
-                        try {
-                            await message.clickButton(customId);
-                            success = true;
-                        } catch (e) {}
+                    if (typeof message.clickButton === 'function') {
+                        promises.push(
+                            (async () => {
+                                try {
+                                    await message.clickButton(customId);
+                                    return true;
+                                } catch (e) { return false; }
+                            })()
+                        );
                     }
                     
                     // Method 3: REST API
-                    if (!success && sessionId) {
-                        try {
-                            const payload = {
-                                type: 3,
-                                nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
-                                guild_id: message.guildId || message.guild?.id,
-                                channel_id: message.channel.id,
-                                message_id: message.id,
-                                application_id: message.applicationId || message.author?.id,
-                                session_id: sessionId,
-                                data: { component_type: 2, custom_id: customId }
-                            };
-                            await this.client.rest.post('/interactions', { body: payload });
-                            success = true;
-                        } catch (e) {}
+                    if (sessionId) {
+                        promises.push(
+                            (async () => {
+                                try {
+                                    await this.client.rest.post('/interactions', {
+                                        body: {
+                                            type: 3,
+                                            nonce: nonce,
+                                            guild_id: message.guildId || message.guild?.id,
+                                            channel_id: channelId,
+                                            message_id: messageId,
+                                            application_id: message.applicationId || message.author?.id,
+                                            session_id: sessionId,
+                                            data: { component_type: 2, custom_id: customId }
+                                        }
+                                    });
+                                    return true;
+                                } catch (e) { return false; }
+                            })()
+                        );
                     }
                     
                     // Method 4: Raw fetch
-                    if (!success && sessionId) {
-                        try {
-                            const res = await fetch('https://discord.com/api/v9/interactions', {
-                                method: 'POST',
-                                headers: { 
-                                    'Authorization': this.config.token, 
-                                    'Content-Type': 'application/json' 
-                                },
-                                body: JSON.stringify({
-                                    type: 3,
-                                    nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
-                                    guild_id: message.guildId || message.guild?.id,
-                                    channel_id: message.channel.id,
-                                    message_id: message.id,
-                                    application_id: message.applicationId || message.author?.id,
-                                    session_id: sessionId,
-                                    data: { component_type: 2, custom_id: customId }
-                                })
-                            });
-                            if (res.ok || res.status === 204) success = true;
-                        } catch (e) {}
+                    if (sessionId) {
+                        promises.push(
+                            (async () => {
+                                try {
+                                    const res = await fetch('https://discord.com/api/v9/interactions', {
+                                        method: 'POST',
+                                        headers: { 
+                                            'Authorization': this.config.token, 
+                                            'Content-Type': 'application/json' 
+                                        },
+                                        body: JSON.stringify({
+                                            type: 3,
+                                            nonce: nonce,
+                                            guild_id: message.guildId || message.guild?.id,
+                                            channel_id: channelId,
+                                            message_id: messageId,
+                                            application_id: message.applicationId || message.author?.id,
+                                            session_id: sessionId,
+                                            data: { component_type: 2, custom_id: customId }
+                                        })
+                                    });
+                                    return res.ok || res.status === 204;
+                                } catch (e) { return false; }
+                            })()
+                        );
                     }
+                    
+                    // Race - whichever succeeds first wins
+                    const results = await Promise.all(promises);
+                    const success = results.some(r => r === true);
                     
                     if (success) {
                         this.lastClaimTime = Date.now();
-                        this.currentTicket = message.channel.id;
-                        this.claimedChannels.add(message.channel.id);
-                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
-                        console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
+                        this.currentTicket = channelId;
+                        this.claimedChannels.add(channelId);
+                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(channelId, this.userId);
+                        console.log(`[CLAIMED] ${this.userId} -> ${channelId}`);
                         
-                        // Keep lock for 2 seconds to prevent double-click
+                        // Short lock to prevent double-click, then release
                         setTimeout(() => {
-                            this.claimingInProgress.delete(message.channel.id);
-                        }, 2000);
+                            this.claimingInProgress.delete(channelId);
+                        }, 500);
                         
                         // Auto-release after 2 minutes
                         setTimeout(() => {
-                            if (this.currentTicket === message.channel.id) {
+                            if (this.currentTicket === channelId) {
                                 this.currentTicket = null;
-                                this.claimedChannels.delete(message.channel.id);
+                                this.claimedChannels.delete(channelId);
                                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
                             }
                         }, 120000);
@@ -336,11 +369,9 @@ class SelfbotManager {
             }
         } catch (e) {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
-        } finally {
-            if (!this.claimedChannels.has(message.channel.id)) {
-                this.claimingInProgress.delete(message.channel.id);
-            }
         }
+        
+        this.claimingInProgress.delete(channelId);
         return false;
     }
 
