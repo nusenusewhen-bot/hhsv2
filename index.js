@@ -23,7 +23,7 @@ if (!BOT_TOKEN || !OWNER_ID) {
 
 const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const activeSelfbots = new Map();
-const globalClaimLocks = new Map(); // Cross-instance lock
+const globalClaimLocks = new Map();
 
 class SelfbotManager {
     constructor(userId, config) {
@@ -38,6 +38,7 @@ class SelfbotManager {
         this.pollInterval = null;
         this.readyFired = false;
         this.lastClaimTime = 0;
+        this.releaseTimeout = null;
     }
 
     async start() {
@@ -62,20 +63,14 @@ class SelfbotManager {
                 if (!this.readyFired) readyHandler();
             }, 10000);
 
-            // INSTANT: Raw WebSocket event for channel create - fastest possible detection
             this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                 if (this.currentTicket) return;
                 if (packet.parent_id !== this.config.category_id) return;
-                
-                // IMMEDIATE: No delay, direct channel ID extraction
                 const channelId = packet.id;
                 if (!channelId || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
-                
-                // Fire instantly
                 this.instantPollChannel(channelId);
             });
 
-            // Backup: Regular event handler
             this.client.on('channelCreate', async (channel) => {
                 if (this.currentTicket) return;
                 if (channel.parentId !== this.config.category_id) return;
@@ -99,13 +94,7 @@ class SelfbotManager {
             });
 
             this.client.on('channelDelete', (ch) => {
-                this.claimedChannels.delete(ch.id);
-                this.processingChannels.delete(ch.id);
-                this.claimingInProgress.delete(ch.id);
-                if (this.currentTicket === ch.id) {
-                    this.currentTicket = null;
-                    db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-                }
+                this.clearTicketState(ch.id);
             });
             
             this.client.on('error', (err) => {
@@ -121,6 +110,23 @@ class SelfbotManager {
         }
     }
 
+    clearTicketState(channelId) {
+        this.claimedChannels.delete(channelId);
+        this.processingChannels.delete(channelId);
+        this.claimingInProgress.delete(channelId);
+        
+        for (const [key, val] of globalClaimLocks.entries()) {
+            if (key.startsWith(`${channelId}-`)) {
+                globalClaimLocks.delete(key);
+            }
+        }
+        
+        if (this.currentTicket === channelId) {
+            this.currentTicket = null;
+            db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+        }
+    }
+
     hasComponents(msg) {
         const c = msg.components;
         if (!c) return false;
@@ -131,7 +137,7 @@ class SelfbotManager {
 
     startPolling() {
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 50); // Faster polling: 50ms
+        this.pollInterval = setInterval(() => this.doPoll(), 50);
     }
 
     async doPoll() {
@@ -156,14 +162,12 @@ class SelfbotManager {
         }
     }
 
-    // INSTANT: Zero-delay channel polling
     async instantPollChannel(channelId) {
         if (this.currentTicket || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
         
         this.processingChannels.add(channelId);
         
         try {
-            // Try cache first for speed
             let channel = this.client.channels.cache.get(channelId);
             if (!channel) {
                 channel = await this.client.channels.fetch(channelId);
@@ -173,11 +177,9 @@ class SelfbotManager {
                 return;
             }
             
-            // INSTANT fetch - no delay
             const messages = await channel.messages.fetch({ limit: 5 });
-            
-            // Check ALL messages immediately
             const msgArray = Array.from(messages.values());
+            
             for (const msg of msgArray) {
                 if (this.currentTicket) break;
                 if (this.hasComponents(msg)) {
@@ -188,15 +190,12 @@ class SelfbotManager {
                     }
                 }
             }
-        } catch (e) {
-            // Silent fail for speed
-        }
+        } catch (e) {}
         
         this.processingChannels.delete(channelId);
     }
 
     async tryClickClaim(message) {
-        // STRICT ANTI-DOUBLE-CLICK: Multiple guard layers
         if (this.currentTicket) return false;
         
         const channelId = message.channel.id;
@@ -208,9 +207,8 @@ class SelfbotManager {
         if (globalClaimLocks.has(lockKey)) return false;
         
         const now = Date.now();
-        if (now - this.lastClaimTime < 300) return false; // 300ms global throttle
+        if (now - this.lastClaimTime < 300) return false;
         
-        // ATOMIC LOCK: Set all locks immediately
         this.claimingInProgress.add(channelId);
         globalClaimLocks.set(lockKey, now);
         
@@ -268,29 +266,24 @@ class SelfbotManager {
                     
                     console.log(`[CLAIM_TRY] ${this.userId} | ${customId} | "${label}"`);
                     
-                    // PARALLEL EXECUTION: Fire all methods simultaneously for maximum speed
                     const now = Date.now();
                     const sessionId = this.client.sessionId || this.client.ws?.sessionId;
                     const nonce = `${now}${Math.floor(Math.random() * 1000000)}`;
                     
                     const promises = [];
-                    let success = false;
                     
-                    // Method 1: Direct button click
                     if (typeof btn.click === 'function') {
                         promises.push(
                             btn.click().then(() => true).catch(() => false)
                         );
                     }
                     
-                    // Method 2: Message clickButton
                     if (typeof message.clickButton === 'function') {
                         promises.push(
                             message.clickButton(customId).then(() => true).catch(() => false)
                         );
                     }
                     
-                    // Method 3: REST API
                     if (sessionId) {
                         promises.push(
                             this.client.rest.post('/interactions', {
@@ -308,7 +301,6 @@ class SelfbotManager {
                         );
                     }
                     
-                    // Method 4: Raw fetch
                     if (sessionId) {
                         promises.push(
                             fetch('https://discord.com/api/v9/interactions', {
@@ -331,7 +323,7 @@ class SelfbotManager {
                         );
                     }
                     
-                    // Race all methods - whichever succeeds first wins
+                    let success = false;
                     if (promises.length > 0) {
                         const results = await Promise.all(promises);
                         success = results.some(r => r === true);
@@ -344,19 +336,15 @@ class SelfbotManager {
                         db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(channelId, this.userId);
                         console.log(`[CLAIMED] ${this.userId} -> ${channelId}`);
                         
-                        // Keep locks for 3 seconds to prevent ANY double-click
-                        setTimeout(() => {
-                            this.claimingInProgress.delete(channelId);
-                            globalClaimLocks.delete(lockKey);
-                        }, 3000);
+                        // Clear the release timeout if exists
+                        if (this.releaseTimeout) {
+                            clearTimeout(this.releaseTimeout);
+                        }
                         
                         // Auto-release after 2 minutes
-                        setTimeout(() => {
-                            if (this.currentTicket === channelId) {
-                                this.currentTicket = null;
-                                this.claimedChannels.delete(channelId);
-                                db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-                            }
+                        this.releaseTimeout = setTimeout(() => {
+                            console.log(`[AUTO_RELEASE] ${this.userId} -> ${channelId}`);
+                            this.clearTicketState(channelId);
                         }, 120000);
                         
                         return true;
@@ -367,15 +355,25 @@ class SelfbotManager {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
         }
         
-        // Release locks if failed
         this.claimingInProgress.delete(channelId);
         globalClaimLocks.delete(lockKey);
         return false;
     }
 
     stop() {
+        if (this.releaseTimeout) clearTimeout(this.releaseTimeout);
         if (this.pollInterval) clearInterval(this.pollInterval);
         if (this.client) this.client.destroy();
+        
+        // Clear all locks for this user's channels
+        for (const chId of this.claimedChannels) {
+            for (const [key, val] of globalClaimLocks.entries()) {
+                if (key.startsWith(`${chId}-`)) {
+                    globalClaimLocks.delete(key);
+                }
+            }
+        }
+        
         this.currentTicket = null;
         this.claimedChannels.clear();
         this.processingChannels.clear();
