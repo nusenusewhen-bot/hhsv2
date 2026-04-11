@@ -23,6 +23,7 @@ if (!BOT_TOKEN || !OWNER_ID) {
 
 const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const activeSelfbots = new Map();
+const globalClaimLocks = new Map(); // Cross-instance lock
 
 class SelfbotManager {
     constructor(userId, config) {
@@ -32,11 +33,11 @@ class SelfbotManager {
         this.currentTicket = config.current_ticket;
         this.claimedChannels = new Set();
         this.processingChannels = new Set();
-        this.claimingInProgress = new Set(); // Anti-double-click
+        this.claimingInProgress = new Set();
         this.errorCount = 0;
         this.pollInterval = null;
         this.readyFired = false;
-        this.lastClaimTime = 0; // Global throttle
+        this.lastClaimTime = 0;
     }
 
     async start() {
@@ -61,7 +62,26 @@ class SelfbotManager {
                 if (!this.readyFired) readyHandler();
             }, 10000);
 
-            // FAST: Immediate event handlers
+            // INSTANT: Raw WebSocket event for channel create - fastest possible detection
+            this.client.ws.on('CHANNEL_CREATE', async (packet) => {
+                if (this.currentTicket) return;
+                if (packet.parent_id !== this.config.category_id) return;
+                
+                // IMMEDIATE: No delay, direct channel ID extraction
+                const channelId = packet.id;
+                if (!channelId || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
+                
+                // Fire instantly
+                this.instantPollChannel(channelId);
+            });
+
+            // Backup: Regular event handler
+            this.client.on('channelCreate', async (channel) => {
+                if (this.currentTicket) return;
+                if (channel.parentId !== this.config.category_id) return;
+                this.instantPollChannel(channel.id);
+            });
+
             this.client.on('messageCreate', async (message) => {
                 if (this.currentTicket) return;
                 if (message.channel.parentId !== this.config.category_id) return;
@@ -76,12 +96,6 @@ class SelfbotManager {
                 if (this.hasComponents(message)) {
                     await this.tryClickClaim(message);
                 }
-            });
-
-            this.client.ws.on('CHANNEL_CREATE', async (packet) => {
-                if (packet.parent_id !== this.config.category_id) return;
-                // Instant poll
-                this.pollChannel(packet.id);
             });
 
             this.client.on('channelDelete', (ch) => {
@@ -108,7 +122,6 @@ class SelfbotManager {
     }
 
     hasComponents(msg) {
-        // Check both array and collection formats
         const c = msg.components;
         if (!c) return false;
         if (Array.isArray(c) && c.length > 0) return true;
@@ -118,7 +131,7 @@ class SelfbotManager {
 
     startPolling() {
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 100);
+        this.pollInterval = setInterval(() => this.doPoll(), 50); // Faster polling: 50ms
     }
 
     async doPoll() {
@@ -132,13 +145,10 @@ class SelfbotManager {
                     ch.parentId === this.config.category_id && ch.isTextBased()
                 );
                 
-                // Fast sequential to avoid rate limits
                 for (const [, channel] of categoryChannels) {
                     if (this.currentTicket) break;
                     if (this.claimedChannels.has(channel.id) || this.processingChannels.has(channel.id)) continue;
-                    
-                    // Non-blocking fire-and-forget with instant check
-                    this.pollChannel(channel.id);
+                    this.instantPollChannel(channel.id);
                 }
             }
         } catch (e) {
@@ -146,65 +156,86 @@ class SelfbotManager {
         }
     }
 
-    async pollChannel(channelId) {
+    // INSTANT: Zero-delay channel polling
+    async instantPollChannel(channelId) {
         if (this.currentTicket || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
         
         this.processingChannels.add(channelId);
         
         try {
-            const channel = await this.client.channels.fetch(channelId);
-            if (!channel) return;
+            // Try cache first for speed
+            let channel = this.client.channels.cache.get(channelId);
+            if (!channel) {
+                channel = await this.client.channels.fetch(channelId);
+            }
+            if (!channel) {
+                this.processingChannels.delete(channelId);
+                return;
+            }
             
-            // No delay - instant fetch
-            const messages = await channel.messages.fetch({ limit: 3 });
+            // INSTANT fetch - no delay
+            const messages = await channel.messages.fetch({ limit: 5 });
             
-            // Check newest first (most likely to have unclaimed button)
+            // Check ALL messages immediately
             const msgArray = Array.from(messages.values());
             for (const msg of msgArray) {
                 if (this.currentTicket) break;
                 if (this.hasComponents(msg)) {
                     const claimed = await this.tryClickClaim(msg);
-                    if (claimed) return;
+                    if (claimed) {
+                        this.processingChannels.delete(channelId);
+                        return;
+                    }
                 }
             }
         } catch (e) {
-            // Silent
-        } finally {
-            // Quick cleanup
-            setTimeout(() => this.processingChannels.delete(channelId), 50);
+            // Silent fail for speed
         }
+        
+        this.processingChannels.delete(channelId);
     }
 
     async tryClickClaim(message) {
-        // ANTI-DOUBLE-CLICK: Multiple guard layers
+        // STRICT ANTI-DOUBLE-CLICK: Multiple guard layers
         if (this.currentTicket) return false;
-        if (this.claimedChannels.has(message.channel.id)) return false;
-        if (this.claimingInProgress.has(message.channel.id)) return false;
         
-        // Global claim throttle (prevent double clicks across events)
+        const channelId = message.channel.id;
+        const messageId = message.id;
+        const lockKey = `${channelId}-${messageId}`;
+        
+        if (this.claimedChannels.has(channelId)) return false;
+        if (this.claimingInProgress.has(channelId)) return false;
+        if (globalClaimLocks.has(lockKey)) return false;
+        
         const now = Date.now();
-        if (now - this.lastClaimTime < 500) return false; // 500ms global throttle
+        if (now - this.lastClaimTime < 300) return false; // 300ms global throttle
         
-        // LOCK: Mark as claiming immediately
-        this.claimingInProgress.add(message.channel.id);
+        // ATOMIC LOCK: Set all locks immediately
+        this.claimingInProgress.add(channelId);
+        globalClaimLocks.set(lockKey, now);
         
         try {
             const components = message.components;
             if (!components || (!components.length && !components.size)) {
+                this.claimingInProgress.delete(channelId);
+                globalClaimLocks.delete(lockKey);
                 return false;
             }
             
-            // Convert to array reliably
             let rows;
             if (Array.isArray(components)) {
                 rows = components;
             } else if (components.values) {
                 rows = Array.from(components.values());
             } else {
-                rows = [components]; // Single row case
+                rows = [components];
             }
             
-            if (!rows.length) return false;
+            if (!rows.length) {
+                this.claimingInProgress.delete(channelId);
+                globalClaimLocks.delete(lockKey);
+                return false;
+            }
             
             const claimRegex = /(claim|accept|take|open|get|start|new|ticket)/i;
             const closeRegex = /(close|delete|end|cancel|shutdown|finish|archive)/i;
@@ -212,7 +243,6 @@ class SelfbotManager {
             for (const row of rows) {
                 if (!row || !row.components) continue;
                 
-                // Get buttons array
                 let buttons;
                 if (Array.isArray(row.components)) {
                     buttons = row.components;
@@ -225,71 +255,63 @@ class SelfbotManager {
                 for (const btn of buttons) {
                     if (!btn) continue;
                     
-                    // Extract properties with fallbacks
                     const label = (btn.label || btn.text || '').toString().trim().toLowerCase();
                     const customId = btn.customId || btn.custom_id || btn.data?.custom_id;
                     const disabled = btn.disabled === true;
                     const type = btn.type || btn.componentType || btn.data?.component_type;
                     
-                    // Must be button, not disabled, has customId
                     if (type !== 2 && type !== 'BUTTON') continue;
                     if (disabled) continue;
                     if (!customId) continue;
-                    
-                    // Must match claim, not close
                     if (closeRegex.test(label)) continue;
                     if (!claimRegex.test(label)) continue;
                     
                     console.log(`[CLAIM_TRY] ${this.userId} | ${customId} | "${label}"`);
                     
-                    // FAST CLAIM: Try all methods immediately
-                    let success = false;
+                    // PARALLEL EXECUTION: Fire all methods simultaneously for maximum speed
+                    const now = Date.now();
                     const sessionId = this.client.sessionId || this.client.ws?.sessionId;
+                    const nonce = `${now}${Math.floor(Math.random() * 1000000)}`;
                     
-                    // Method 1: Direct button click (fastest)
-                    if (!success && typeof btn.click === 'function') {
-                        try {
-                            await btn.click();
-                            success = true;
-                        } catch (e) {
-                            // console.log(`[CLICK_FAIL_1] ${e.message}`);
-                        }
+                    const promises = [];
+                    let success = false;
+                    
+                    // Method 1: Direct button click
+                    if (typeof btn.click === 'function') {
+                        promises.push(
+                            btn.click().then(() => true).catch(() => false)
+                        );
                     }
                     
                     // Method 2: Message clickButton
-                    if (!success && typeof message.clickButton === 'function') {
-                        try {
-                            await message.clickButton(customId);
-                            success = true;
-                        } catch (e) {
-                            // console.log(`[CLICK_FAIL_2] ${e.message}`);
-                        }
+                    if (typeof message.clickButton === 'function') {
+                        promises.push(
+                            message.clickButton(customId).then(() => true).catch(() => false)
+                        );
                     }
                     
                     // Method 3: REST API
-                    if (!success && sessionId) {
-                        try {
-                            const payload = {
-                                type: 3,
-                                nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
-                                guild_id: message.guildId || message.guild?.id,
-                                channel_id: message.channel.id,
-                                message_id: message.id,
-                                application_id: message.applicationId || message.author?.id,
-                                session_id: sessionId,
-                                data: { component_type: 2, custom_id: customId }
-                            };
-                            await this.client.rest.post('/interactions', { body: payload });
-                            success = true;
-                        } catch (e) {
-                            // console.log(`[CLICK_FAIL_3] ${e.message}`);
-                        }
+                    if (sessionId) {
+                        promises.push(
+                            this.client.rest.post('/interactions', {
+                                body: {
+                                    type: 3,
+                                    nonce: nonce,
+                                    guild_id: message.guildId || message.guild?.id,
+                                    channel_id: channelId,
+                                    message_id: messageId,
+                                    application_id: message.applicationId || message.author?.id,
+                                    session_id: sessionId,
+                                    data: { component_type: 2, custom_id: customId }
+                                }
+                            }).then(() => true).catch(() => false)
+                        );
                     }
                     
                     // Method 4: Raw fetch
-                    if (!success && sessionId) {
-                        try {
-                            const res = await fetch('https://discord.com/api/v9/interactions', {
+                    if (sessionId) {
+                        promises.push(
+                            fetch('https://discord.com/api/v9/interactions', {
                                 method: 'POST',
                                 headers: { 
                                     'Authorization': this.config.token, 
@@ -297,39 +319,42 @@ class SelfbotManager {
                                 },
                                 body: JSON.stringify({
                                     type: 3,
-                                    nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
+                                    nonce: nonce,
                                     guild_id: message.guildId || message.guild?.id,
-                                    channel_id: message.channel.id,
-                                    message_id: message.id,
+                                    channel_id: channelId,
+                                    message_id: messageId,
                                     application_id: message.applicationId || message.author?.id,
                                     session_id: sessionId,
                                     data: { component_type: 2, custom_id: customId }
                                 })
-                            });
-                            if (res.ok || res.status === 204) success = true;
-                        } catch (e) {
-                            // console.log(`[CLICK_FAIL_4] ${e.message}`);
-                        }
+                            }).then(r => r.ok || r.status === 204).catch(() => false)
+                        );
+                    }
+                    
+                    // Race all methods - whichever succeeds first wins
+                    if (promises.length > 0) {
+                        const results = await Promise.all(promises);
+                        success = results.some(r => r === true);
                     }
                     
                     if (success) {
-                        // SUCCESS - Mark claimed
                         this.lastClaimTime = Date.now();
-                        this.currentTicket = message.channel.id;
-                        this.claimedChannels.add(message.channel.id);
-                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
-                        console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
+                        this.currentTicket = channelId;
+                        this.claimedChannels.add(channelId);
+                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(channelId, this.userId);
+                        console.log(`[CLAIMED] ${this.userId} -> ${channelId}`);
                         
-                        // Keep lock for 2 seconds to prevent any double-click
+                        // Keep locks for 3 seconds to prevent ANY double-click
                         setTimeout(() => {
-                            this.claimingInProgress.delete(message.channel.id);
-                        }, 2000);
+                            this.claimingInProgress.delete(channelId);
+                            globalClaimLocks.delete(lockKey);
+                        }, 3000);
                         
                         // Auto-release after 2 minutes
                         setTimeout(() => {
-                            if (this.currentTicket === message.channel.id) {
+                            if (this.currentTicket === channelId) {
                                 this.currentTicket = null;
-                                this.claimedChannels.delete(message.channel.id);
+                                this.claimedChannels.delete(channelId);
                                 db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
                             }
                         }, 120000);
@@ -340,12 +365,11 @@ class SelfbotManager {
             }
         } catch (e) {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
-        } finally {
-            // Release lock if not claimed (claimed has its own timeout)
-            if (!this.claimedChannels.has(message.channel.id)) {
-                this.claimingInProgress.delete(message.channel.id);
-            }
         }
+        
+        // Release locks if failed
+        this.claimingInProgress.delete(channelId);
+        globalClaimLocks.delete(lockKey);
         return false;
     }
 
@@ -403,7 +427,6 @@ async function buildPanel(userId) {
     return { embeds: [embed], components: [row] };
 }
 
-// ==================== INTERACTION HANDLER ====================
 bot.on('interactionCreate', async (ix) => {
     if (ix.isCommand()) {
         let replied = false;
