@@ -23,7 +23,6 @@ if (!BOT_TOKEN || !OWNER_ID) {
 
 const bot = new BotClient({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 const activeSelfbots = new Map();
-const globalClaimLocks = new Map();
 
 class SelfbotManager {
     constructor(userId, config) {
@@ -38,7 +37,6 @@ class SelfbotManager {
         this.pollInterval = null;
         this.readyFired = false;
         this.lastClaimTime = 0;
-        this.releaseTimeout = null;
     }
 
     async start() {
@@ -63,6 +61,7 @@ class SelfbotManager {
                 if (!this.readyFired) readyHandler();
             }, 10000);
 
+            // FAST: Raw WebSocket event for instant channel create detection
             this.client.ws.on('CHANNEL_CREATE', async (packet) => {
                 if (this.currentTicket) return;
                 if (packet.parent_id !== this.config.category_id) return;
@@ -71,6 +70,7 @@ class SelfbotManager {
                 this.instantPollChannel(channelId);
             });
 
+            // Backup regular handler
             this.client.on('channelCreate', async (channel) => {
                 if (this.currentTicket) return;
                 if (channel.parentId !== this.config.category_id) return;
@@ -94,7 +94,13 @@ class SelfbotManager {
             });
 
             this.client.on('channelDelete', (ch) => {
-                this.clearTicketState(ch.id);
+                this.claimedChannels.delete(ch.id);
+                this.processingChannels.delete(ch.id);
+                this.claimingInProgress.delete(ch.id);
+                if (this.currentTicket === ch.id) {
+                    this.currentTicket = null;
+                    db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+                }
             });
             
             this.client.on('error', (err) => {
@@ -110,23 +116,6 @@ class SelfbotManager {
         }
     }
 
-    clearTicketState(channelId) {
-        this.claimedChannels.delete(channelId);
-        this.processingChannels.delete(channelId);
-        this.claimingInProgress.delete(channelId);
-        
-        for (const [key, val] of globalClaimLocks.entries()) {
-            if (key.startsWith(`${channelId}-`)) {
-                globalClaimLocks.delete(key);
-            }
-        }
-        
-        if (this.currentTicket === channelId) {
-            this.currentTicket = null;
-            db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-        }
-    }
-
     hasComponents(msg) {
         const c = msg.components;
         if (!c) return false;
@@ -137,7 +126,7 @@ class SelfbotManager {
 
     startPolling() {
         this.doPoll();
-        this.pollInterval = setInterval(() => this.doPoll(), 50);
+        this.pollInterval = setInterval(() => this.doPoll(), 100);
     }
 
     async doPoll() {
@@ -168,6 +157,7 @@ class SelfbotManager {
         this.processingChannels.add(channelId);
         
         try {
+            // Cache first for speed
             let channel = this.client.channels.cache.get(channelId);
             if (!channel) {
                 channel = await this.client.channels.fetch(channelId);
@@ -177,9 +167,10 @@ class SelfbotManager {
                 return;
             }
             
-            const messages = await channel.messages.fetch({ limit: 5 });
-            const msgArray = Array.from(messages.values());
+            // No delay - instant fetch
+            const messages = await channel.messages.fetch({ limit: 3 });
             
+            const msgArray = Array.from(messages.values());
             for (const msg of msgArray) {
                 if (this.currentTicket) break;
                 if (this.hasComponents(msg)) {
@@ -190,33 +181,27 @@ class SelfbotManager {
                     }
                 }
             }
-        } catch (e) {}
-        
-        this.processingChannels.delete(channelId);
+        } catch (e) {
+            // Silent
+        } finally {
+            setTimeout(() => this.processingChannels.delete(channelId), 50);
+        }
     }
 
     async tryClickClaim(message) {
+        // ANTI-DOUBLE-CLICK: Multiple guard layers
         if (this.currentTicket) return false;
-        
-        const channelId = message.channel.id;
-        const messageId = message.id;
-        const lockKey = `${channelId}-${messageId}`;
-        
-        if (this.claimedChannels.has(channelId)) return false;
-        if (this.claimingInProgress.has(channelId)) return false;
-        if (globalClaimLocks.has(lockKey)) return false;
+        if (this.claimedChannels.has(message.channel.id)) return false;
+        if (this.claimingInProgress.has(message.channel.id)) return false;
         
         const now = Date.now();
-        if (now - this.lastClaimTime < 300) return false;
+        if (now - this.lastClaimTime < 500) return false;
         
-        this.claimingInProgress.add(channelId);
-        globalClaimLocks.set(lockKey, now);
+        this.claimingInProgress.add(message.channel.id);
         
         try {
             const components = message.components;
             if (!components || (!components.length && !components.size)) {
-                this.claimingInProgress.delete(channelId);
-                globalClaimLocks.delete(lockKey);
                 return false;
             }
             
@@ -229,11 +214,7 @@ class SelfbotManager {
                 rows = [components];
             }
             
-            if (!rows.length) {
-                this.claimingInProgress.delete(channelId);
-                globalClaimLocks.delete(lockKey);
-                return false;
-            }
+            if (!rows.length) return false;
             
             const claimRegex = /(claim|accept|take|open|get|start|new|ticket)/i;
             const closeRegex = /(close|delete|end|cancel|shutdown|finish|archive)/i;
@@ -266,44 +247,48 @@ class SelfbotManager {
                     
                     console.log(`[CLAIM_TRY] ${this.userId} | ${customId} | "${label}"`);
                     
-                    const now = Date.now();
+                    // SEQUENTIAL: Try methods one by one (original logic)
+                    let success = false;
                     const sessionId = this.client.sessionId || this.client.ws?.sessionId;
-                    const nonce = `${now}${Math.floor(Math.random() * 1000000)}`;
                     
-                    const promises = [];
-                    
-                    if (typeof btn.click === 'function') {
-                        promises.push(
-                            btn.click().then(() => true).catch(() => false)
-                        );
+                    // Method 1: Direct button click
+                    if (!success && typeof btn.click === 'function') {
+                        try {
+                            await btn.click();
+                            success = true;
+                        } catch (e) {}
                     }
                     
-                    if (typeof message.clickButton === 'function') {
-                        promises.push(
-                            message.clickButton(customId).then(() => true).catch(() => false)
-                        );
+                    // Method 2: Message clickButton
+                    if (!success && typeof message.clickButton === 'function') {
+                        try {
+                            await message.clickButton(customId);
+                            success = true;
+                        } catch (e) {}
                     }
                     
-                    if (sessionId) {
-                        promises.push(
-                            this.client.rest.post('/interactions', {
-                                body: {
-                                    type: 3,
-                                    nonce: nonce,
-                                    guild_id: message.guildId || message.guild?.id,
-                                    channel_id: channelId,
-                                    message_id: messageId,
-                                    application_id: message.applicationId || message.author?.id,
-                                    session_id: sessionId,
-                                    data: { component_type: 2, custom_id: customId }
-                                }
-                            }).then(() => true).catch(() => false)
-                        );
+                    // Method 3: REST API
+                    if (!success && sessionId) {
+                        try {
+                            const payload = {
+                                type: 3,
+                                nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
+                                guild_id: message.guildId || message.guild?.id,
+                                channel_id: message.channel.id,
+                                message_id: message.id,
+                                application_id: message.applicationId || message.author?.id,
+                                session_id: sessionId,
+                                data: { component_type: 2, custom_id: customId }
+                            };
+                            await this.client.rest.post('/interactions', { body: payload });
+                            success = true;
+                        } catch (e) {}
                     }
                     
-                    if (sessionId) {
-                        promises.push(
-                            fetch('https://discord.com/api/v9/interactions', {
+                    // Method 4: Raw fetch
+                    if (!success && sessionId) {
+                        try {
+                            const res = await fetch('https://discord.com/api/v9/interactions', {
                                 method: 'POST',
                                 headers: { 
                                     'Authorization': this.config.token, 
@@ -311,40 +296,38 @@ class SelfbotManager {
                                 },
                                 body: JSON.stringify({
                                     type: 3,
-                                    nonce: nonce,
+                                    nonce: `${now}${Math.floor(Math.random() * 1000000)}`,
                                     guild_id: message.guildId || message.guild?.id,
-                                    channel_id: channelId,
-                                    message_id: messageId,
+                                    channel_id: message.channel.id,
+                                    message_id: message.id,
                                     application_id: message.applicationId || message.author?.id,
                                     session_id: sessionId,
                                     data: { component_type: 2, custom_id: customId }
                                 })
-                            }).then(r => r.ok || r.status === 204).catch(() => false)
-                        );
-                    }
-                    
-                    let success = false;
-                    if (promises.length > 0) {
-                        const results = await Promise.all(promises);
-                        success = results.some(r => r === true);
+                            });
+                            if (res.ok || res.status === 204) success = true;
+                        } catch (e) {}
                     }
                     
                     if (success) {
                         this.lastClaimTime = Date.now();
-                        this.currentTicket = channelId;
-                        this.claimedChannels.add(channelId);
-                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(channelId, this.userId);
-                        console.log(`[CLAIMED] ${this.userId} -> ${channelId}`);
+                        this.currentTicket = message.channel.id;
+                        this.claimedChannels.add(message.channel.id);
+                        db.prepare('UPDATE users SET current_ticket = ? WHERE user_id = ?').run(message.channel.id, this.userId);
+                        console.log(`[CLAIMED] ${this.userId} -> ${message.channel.id}`);
                         
-                        // Clear the release timeout if exists
-                        if (this.releaseTimeout) {
-                            clearTimeout(this.releaseTimeout);
-                        }
+                        // Keep lock for 2 seconds to prevent double-click
+                        setTimeout(() => {
+                            this.claimingInProgress.delete(message.channel.id);
+                        }, 2000);
                         
                         // Auto-release after 2 minutes
-                        this.releaseTimeout = setTimeout(() => {
-                            console.log(`[AUTO_RELEASE] ${this.userId} -> ${channelId}`);
-                            this.clearTicketState(channelId);
+                        setTimeout(() => {
+                            if (this.currentTicket === message.channel.id) {
+                                this.currentTicket = null;
+                                this.claimedChannels.delete(message.channel.id);
+                                db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+                            }
                         }, 120000);
                         
                         return true;
@@ -353,27 +336,17 @@ class SelfbotManager {
             }
         } catch (e) {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
+        } finally {
+            if (!this.claimedChannels.has(message.channel.id)) {
+                this.claimingInProgress.delete(message.channel.id);
+            }
         }
-        
-        this.claimingInProgress.delete(channelId);
-        globalClaimLocks.delete(lockKey);
         return false;
     }
 
     stop() {
-        if (this.releaseTimeout) clearTimeout(this.releaseTimeout);
         if (this.pollInterval) clearInterval(this.pollInterval);
         if (this.client) this.client.destroy();
-        
-        // Clear all locks for this user's channels
-        for (const chId of this.claimedChannels) {
-            for (const [key, val] of globalClaimLocks.entries()) {
-                if (key.startsWith(`${chId}-`)) {
-                    globalClaimLocks.delete(key);
-                }
-            }
-        }
-        
         this.currentTicket = null;
         this.claimedChannels.clear();
         this.processingChannels.clear();
