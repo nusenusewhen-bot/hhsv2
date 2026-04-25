@@ -34,6 +34,7 @@ class SelfbotManager {
         this.processingChannels = new Set();
         this.claimingInProgress = new Set();
         this.errorCount = 0;
+        this.isClaiming = false;
         this.pollInterval = null;
         this.readyFired = false;
         this.lastClaimTime = 0;
@@ -96,13 +97,7 @@ class SelfbotManager {
             });
 
             this.client.on('channelDelete', (ch) => {
-                this.claimedChannels.delete(ch.id);
-                this.processingChannels.delete(ch.id);
-                this.claimingInProgress.delete(ch.id);
-                if (this.currentTicket === ch.id) {
-                    this.currentTicket = null;
-                    db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-                }
+                this.releaseTicket(ch.id);
             });
             
             this.client.on('error', (err) => {
@@ -132,7 +127,20 @@ class SelfbotManager {
     }
 
     async doPoll() {
-        if (this.currentTicket) return;
+        if (this.currentTicket) {
+            // Verify our claimed ticket still exists and is visible
+            const ch = this.client.channels.cache.get(this.currentTicket);
+            if (!ch) {
+                const fetched = await this.client.channels.fetch(this.currentTicket).catch(() => null);
+                if (!fetched) {
+                    this.releaseTicket(this.currentTicket);
+                } else {
+                    return; // valid but not cached, keep monitoring
+                }
+            } else {
+                return; // have valid ticket, monitor only
+            }
+        }
         try {
             for (const [, guild] of this.client.guilds.cache) {
                 const categoryChannels = guild.channels.cache.filter(ch => 
@@ -152,7 +160,7 @@ class SelfbotManager {
 
     // RACE: Fetch and claim as fast as possible
     async raceToClaim(channelId) {
-        if (this.currentTicket || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
+        if (this.currentTicket || this.isClaiming || this.claimedChannels.has(channelId) || this.processingChannels.has(channelId)) return;
         
         this.processingChannels.add(channelId);
         
@@ -198,16 +206,17 @@ class SelfbotManager {
         
         if (this.claimedChannels.has(channelId)) return false;
         if (this.claimingInProgress.has(channelId)) return false;
+        if (this.isClaiming) return false;
         
         const now = Date.now();
         if (now - this.lastClaimTime < 100) return false; // 100ms throttle only
         
+        this.isClaiming = true;
         this.claimingInProgress.add(channelId);
         
         try {
             const components = message.components;
             if (!components || (!components.length && !components.size)) {
-                this.claimingInProgress.delete(channelId);
                 return false;
             }
             
@@ -221,7 +230,6 @@ class SelfbotManager {
             }
             
             if (!rows.length) {
-                this.claimingInProgress.delete(channelId);
                 return false;
             }
             
@@ -343,6 +351,11 @@ class SelfbotManager {
                     const success = results.some(r => r === true);
                     
                     if (success) {
+                        // FINAL GUARD: another claim may have won the race while we were awaiting
+                        if (this.currentTicket) {
+                            return false;
+                        }
+                        
                         this.lastClaimTime = Date.now();
                         this.currentTicket = channelId;
                         this.claimedChannels.add(channelId);
@@ -356,11 +369,7 @@ class SelfbotManager {
                         
                         // Auto-release after 2 minutes
                         setTimeout(() => {
-                            if (this.currentTicket === channelId) {
-                                this.currentTicket = null;
-                                this.claimedChannels.delete(channelId);
-                                db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
-                            }
+                            this.releaseTicket(channelId);
                         }, 120000);
                         
                         return true;
@@ -369,10 +378,23 @@ class SelfbotManager {
             }
         } catch (e) {
             console.error(`[TRY_CLICK_ERR] ${e.message}`);
+        } finally {
+            this.claimingInProgress.delete(channelId);
+            this.isClaiming = false;
         }
         
-        this.claimingInProgress.delete(channelId);
         return false;
+    }
+
+    releaseTicket(channelId) {
+        this.claimedChannels.delete(channelId);
+        this.processingChannels.delete(channelId);
+        this.claimingInProgress.delete(channelId);
+        if (this.currentTicket === channelId) {
+            this.currentTicket = null;
+            db.prepare('UPDATE users SET current_ticket = NULL WHERE user_id = ?').run(this.userId);
+            console.log(`[RELEASED] ${this.userId} from ${channelId}`);
+        }
     }
 
     stop() {
@@ -382,6 +404,7 @@ class SelfbotManager {
         this.claimedChannels.clear();
         this.processingChannels.clear();
         this.claimingInProgress.clear();
+        this.isClaiming = false;
         this.readyFired = false;
         db.prepare('UPDATE users SET is_running = 0, current_ticket = NULL WHERE user_id = ?').run(this.userId);
     }
@@ -409,21 +432,21 @@ async function buildPanel(userId) {
     const hasCategory = !!user.category_id;
     
     const embed = new EmbedBuilder()
-        .setTitle('🎫 Ticket Claimer')
+        .setTitle('ð« Ticket Claimer')
         .addFields(
-            { name: 'Status', value: running ? '🟢 Running' : '🔴 Stopped', inline: true },
-            { name: 'Token', value: hasToken ? '✅ Set' : '❌ Not set', inline: true },
-            { name: 'Category', value: hasCategory ? '✅ Set' : '❌ Not set', inline: true },
+            { name: 'Status', value: running ? 'ð¢ Running' : 'ð´ Stopped', inline: true },
+            { name: 'Token', value: hasToken ? 'â Set' : 'â Not set', inline: true },
+            { name: 'Category', value: hasCategory ? 'â Set' : 'â Not set', inline: true },
             { name: 'Current', value: user.current_ticket || 'None', inline: true },
             { name: 'Last Error', value: user.last_error || 'None', inline: false }
         )
         .setColor(running ? 0x00FF00 : 0xFFA500);
 
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`token_${userId}`).setLabel('🔐 Token').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`cat_${userId}`).setLabel('📁 Category').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('▶️ Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !hasCategory || running),
-        new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel('🛑 Stop').setStyle(ButtonStyle.Danger).setDisabled(!running)
+        new ButtonBuilder().setCustomId(`token_${userId}`).setLabel('ð Token').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`cat_${userId}`).setLabel('ð Category').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('â¶ï¸ Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !hasCategory || running),
+        new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel('ð Stop').setStyle(ButtonStyle.Danger).setDisabled(!running)
     );
 
     return { embeds: [embed], components: [row] };
@@ -439,7 +462,7 @@ bot.on('interactionCreate', async (ix) => {
             }
         } catch (e) {
             console.error(`[DEFER_FAILED] ${ix.commandName}: ${e.message}`);
-            try { return ix.reply({ content: '❌ Failed to process.', flags: MessageFlags.Ephemeral }); } catch {}
+            try { return ix.reply({ content: 'â Failed to process.', flags: MessageFlags.Ephemeral }); } catch {}
             return;
         }
 
@@ -453,12 +476,12 @@ bot.on('interactionCreate', async (ix) => {
                     const key = 'TKT-' + crypto.randomBytes(8).toString('hex').toUpperCase();
                     const exp = days === -1 ? null : Date.now() + (days * 86400000);
                     db.prepare('INSERT INTO keys (key, duration_days, created_at, expires_at) VALUES (?, ?, ?, ?)').run(key, days, Date.now(), exp);
-                    return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🔑 Key Generated').setDescription('`' + key + '`').setColor(0x00FF00)] });
+                    return ix.editReply({ embeds: [new EmbedBuilder().setTitle('ð Key Generated').setDescription('`' + key + '`').setColor(0x00FF00)] });
                 }
                 
                 if (ix.commandName === 'revokekey') {
                     db.prepare('UPDATE keys SET active = 0 WHERE key = ?').run(ix.options.getString('key'));
-                    return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 Key Revoked').setColor(0xFF0000)] });
+                    return ix.editReply({ embeds: [new EmbedBuilder().setTitle('ð« Key Revoked').setColor(0xFF0000)] });
                 }
                 
                 if (ix.commandName === 'revokeuser') {
@@ -467,14 +490,14 @@ bot.on('interactionCreate', async (ix) => {
                     if (sb) { sb.stop(); activeSelfbots.delete(uid); }
                     db.prepare('DELETE FROM users WHERE user_id = ?').run(uid);
                     db.prepare('UPDATE keys SET active = 0 WHERE redeemed_by = ?').run(uid);
-                    return ix.editReply({ embeds: [new EmbedBuilder().setTitle('🚫 User Revoked').setColor(0xFF0000)] });
+                    return ix.editReply({ embeds: [new EmbedBuilder().setTitle('ð« User Revoked').setColor(0xFF0000)] });
                 }
 
                 if (ix.commandName === 'sales') {
                     const total = db.prepare('SELECT COUNT(*) as c FROM keys').get().c;
                     const redeemed = db.prepare('SELECT COUNT(*) as c FROM keys WHERE redeemed_by IS NOT NULL').get().c;
                     const active = db.prepare('SELECT COUNT(*) as c FROM users WHERE is_running = 1').get().c;
-                    const embed = new EmbedBuilder().setTitle('📊 Sales Dashboard').setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`).setColor(0x5865F2);
+                    const embed = new EmbedBuilder().setTitle('ð Sales Dashboard').setDescription(`Total: **${total}**\nRedeemed: **${redeemed}**\nActive: **${active}**`).setColor(0x5865F2);
                     return ix.editReply({ embeds: [embed] });
                 }
 
@@ -486,22 +509,22 @@ bot.on('interactionCreate', async (ix) => {
 
             if (ix.commandName === 'redeemkey') {
                 const k = db.prepare('SELECT * FROM keys WHERE key = ? AND active = 1').get(ix.options.getString('key'));
-                if (!k) return ix.editReply('❌ Invalid key');
-                if (k.redeemed_by) return ix.editReply('❌ Key already used');
+                if (!k) return ix.editReply('â Invalid key');
+                if (k.redeemed_by) return ix.editReply('â Key already used');
                 
                 const exp = k.duration_days === -1 ? null : Date.now() + (k.duration_days * 86400000);
                 db.prepare('UPDATE keys SET redeemed_by = ?, redeemed_at = ?, expires_at = ? WHERE key = ?').run(ix.user.id, Date.now(), exp, ix.options.getString('key'));
                 db.prepare('INSERT OR REPLACE INTO users (user_id) VALUES (?)').run(ix.user.id);
-                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('✅ Key Redeemed').setColor(0x00FF00)] });
+                return ix.editReply({ embeds: [new EmbedBuilder().setTitle('â Key Redeemed').setColor(0x00FF00)] });
             }
             
             if (ix.commandName === 'manage') {
                 const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(ix.user.id);
-                if (!user) return ix.editReply('❌ No key found. Use `/redeemkey` first.');
+                if (!user) return ix.editReply('â No key found. Use `/redeemkey` first.');
                 
                 if (ix.user.id !== OWNER_ID) {
                     const key = db.prepare('SELECT * FROM keys WHERE redeemed_by = ? AND active = 1 AND (expires_at > ? OR expires_at IS NULL)').get(ix.user.id, Date.now());
-                    if (!key) return ix.editReply('❌ Key expired');
+                    if (!key) return ix.editReply('â Key expired');
                 }
                 
                 const panel = await buildPanel(ix.user.id);
@@ -510,14 +533,14 @@ bot.on('interactionCreate', async (ix) => {
         } catch (err) {
             console.error(`[COMMAND_ERROR] ${ix.commandName}:`, err);
             if (replied) {
-                try { await ix.editReply('❌ An error occurred.'); } catch {}
+                try { await ix.editReply('â An error occurred.'); } catch {}
             }
         }
     }
 
     if (ix.isButton()) {
         const uid = ix.customId.split('_').pop();
-        if (ix.user.id !== uid) return ix.reply({ content: '❌ Not your panel', flags: MessageFlags.Ephemeral });
+        if (ix.user.id !== uid) return ix.reply({ content: 'â Not your panel', flags: MessageFlags.Ephemeral });
 
         if (ix.customId.startsWith('token_')) {
             return ix.showModal({
@@ -539,7 +562,7 @@ bot.on('interactionCreate', async (ix) => {
             await ix.deferUpdate();
             const user = db.prepare('SELECT * FROM users WHERE user_id = ?').get(uid);
             if (!user?.token || !user?.category_id) {
-                return ix.editReply({ content: '❌ Missing token or category', embeds: [], components: [] });
+                return ix.editReply({ content: 'â Missing token or category', embeds: [], components: [] });
             }
             
             const sb = new SelfbotManager(uid, user);
@@ -564,20 +587,20 @@ bot.on('interactionCreate', async (ix) => {
 
     if (ix.isModalSubmit()) {
         const uid = ix.customId.split('_').pop();
-        if (ix.user.id !== uid) return ix.reply({ content: '❌ Not yours', flags: MessageFlags.Ephemeral });
+        if (ix.user.id !== uid) return ix.reply({ content: 'â Not yours', flags: MessageFlags.Ephemeral });
 
         const val = ix.fields.getTextInputValue('val');
 
         if (ix.customId.startsWith('mod_token_')) {
             await ix.deferReply({ flags: MessageFlags.Ephemeral });
             const check = await validateToken(val);
-            if (!check.valid) return ix.editReply(`❌ Invalid token: ${check.error}`);
+            if (!check.valid) return ix.editReply(`â Invalid token: ${check.error}`);
             
             db.prepare('INSERT OR REPLACE INTO users (user_id, token) VALUES (?, ?)').run(uid, val);
             
             const panel = await buildPanel(uid);
             return ix.editReply({
-                content: `✅ Token validated: **${check.tag}**`,
+                content: `â Token validated: **${check.tag}**`,
                 embeds: panel ? panel.embeds : [],
                 components: panel ? panel.components : []
             });
@@ -587,7 +610,7 @@ bot.on('interactionCreate', async (ix) => {
             db.prepare('UPDATE users SET category_id = ? WHERE user_id = ?').run(val, uid);
             await ix.deferUpdate();
             const panel = await buildPanel(uid);
-            return ix.editReply(panel || { content: '✅ Category updated' });
+            return ix.editReply(panel || { content: 'â Category updated' });
         }
     }
 });
