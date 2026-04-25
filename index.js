@@ -434,19 +434,19 @@ async function buildPanel(userId) {
     const embed = new EmbedBuilder()
         .setTitle('ð« Ticket Claimer')
         .addFields(
-            { name: 'Status', value: running ? 'ð¢ Running' : 'ð´ Stopped', inline: true },
-            { name: 'Token', value: hasToken ? 'â Set' : 'â Not set', inline: true },
-            { name: 'Category', value: hasCategory ? 'â Set' : 'â Not set', inline: true },
+            { name: 'Status', value: running ? '¢ Running' : '´ Stopped', inline: true },
+            { name: 'Token', value: hasToken ? ' Set' : ' Not set', inline: true },
+            { name: 'Category', value: hasCategory ? ' Set' : ' Not set', inline: true },
             { name: 'Current', value: user.current_ticket || 'None', inline: true },
             { name: 'Last Error', value: user.last_error || 'None', inline: false }
         )
         .setColor(running ? 0x00FF00 : 0xFFA500);
 
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`token_${userId}`).setLabel('ð Token').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`cat_${userId}`).setLabel('ð Category').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel('â¶ï¸ Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !hasCategory || running),
-        new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel('ð Stop').setStyle(ButtonStyle.Danger).setDisabled(!running)
+        new ButtonBuilder().setCustomId(`token_${userId}`).setLabel(' Token').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`cat_${userId}`).setLabel(' Category').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`start_${userId}`).setLabel(' Start').setStyle(ButtonStyle.Success).setDisabled(!hasToken || !hasCategory || running),
+        new ButtonBuilder().setCustomId(`stop_${userId}`).setLabel(' Stop').setStyle(ButtonStyle.Danger).setDisabled(!running)
     );
 
     return { embeds: [embed], components: [row] };
@@ -462,7 +462,7 @@ bot.on('interactionCreate', async (ix) => {
             }
         } catch (e) {
             console.error(`[DEFER_FAILED] ${ix.commandName}: ${e.message}`);
-            try { return ix.reply({ content: 'â Failed to process.', flags: MessageFlags.Ephemeral }); } catch {}
+            try { return ix.reply({ content: ' Failed to process.', flags: MessageFlags.Ephemeral }); } catch {}
             return;
         }
 
